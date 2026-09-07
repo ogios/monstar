@@ -68,6 +68,10 @@ pub const Job = struct {
     /// data repointed at cache-pinned copies; empty when no graphics are
     /// visible.
     kitty_items: []const Renderer.KittyRenderItem,
+    /// Animated cursor quad. When set the frame is a full render with full
+    /// damage (like the other overlays): a gliding cursor must repaint the
+    /// cells it crossed, which partial-raster repairs cannot express.
+    cursor_overlay: ?Renderer.CursorOverlay = null,
     /// Any overlay input (kitty snapshot, preedit, link hint, hint
     /// flag) differs from the previously submitted job. Unchanged
     /// overlays over clean content need no repaint.
@@ -83,6 +87,7 @@ pub const Job = struct {
         return self.preedit != null or self.link_hint != null or
             self.search != null or self.search_matches.len > 0 or
             self.scrollbar != null or
+            self.cursor_overlay != null or
             self.kitty_items.len > 0;
     }
 };
@@ -475,6 +480,7 @@ fn workerMain(self: *AsyncRaster) void {
         self.renderer.search_matches = job.search_matches;
         self.renderer.search_bg = job.search_background;
         self.renderer.search_fg = job.search_foreground;
+        self.renderer.cursor_overlay = job.cursor_overlay;
         self.renderer.buffer_stride = job.width;
         var damage: Damage = .full;
         const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;

@@ -111,6 +111,57 @@ pub fn blendCapsule(
     }
 }
 
+/// Fill a convex quadrilateral defined by four grid-pixel corners
+/// (top-left, top-right, bottom-right, bottom-left). The quad is the
+/// animated-cursor shape: a rectangle sheared by independent corner
+/// springs, always convex. Interpolating the left and right edges across
+/// each scanline produces the fill.
+pub fn fillQuad(
+    pixels: []u32,
+    stride: u31,
+    buf_width: u31,
+    buf_height: u31,
+    corners: [4][2]i32,
+    color: u32,
+) void {
+    const tl = corners[0];
+    const tr = corners[1];
+    const br = corners[2];
+    const bl = corners[3];
+
+    var y_min: i32 = tl[1];
+    var y_max: i32 = tl[1];
+    for (corners[1..]) |c| {
+        y_min = @min(y_min, c[1]);
+        y_max = @max(y_max, c[1]);
+    }
+    const y_start: i32 = @max(0, y_min);
+    const y_end: i32 = @min(@as(i32, @intCast(buf_height)), y_max + 1);
+    if (y_end <= y_start) return;
+
+    // Left edge runs top-left -> bottom-left; right edge top-right ->
+    // bottom-right. Edge x positions are linearly interpolated along the
+    // quad's vertical extent (a sheared rectangle keeps both edges linear
+    // in y even when the top and bottom widths differ).
+    const l_dy: f32 = @floatFromInt(bl[1] - tl[1]);
+    const r_dy: f32 = @floatFromInt(br[1] - tr[1]);
+    const l_dx: f32 = @floatFromInt(bl[0] - tl[0]);
+    const r_dx: f32 = @floatFromInt(br[0] - tr[0]);
+
+    for (@as(u32, @intCast(y_start))..@as(u32, @intCast(y_end))) |y| {
+        const fy = @as(f32, @floatFromInt(y)) + 0.5;
+        const l_frac: f32 = if (l_dy == 0) 0 else (fy - @as(f32, @floatFromInt(tl[1]))) / l_dy;
+        const r_frac: f32 = if (r_dy == 0) 0 else (fy - @as(f32, @floatFromInt(tr[1]))) / r_dy;
+        const left: i32 = @intFromFloat(@floor(@as(f32, @floatFromInt(tl[0])) + l_dx * l_frac));
+        const right: i32 = @intFromFloat(@floor(@as(f32, @floatFromInt(tr[0])) + r_dx * r_frac));
+        const x_start: i32 = @max(0, @min(left, right));
+        const x_end: i32 = @min(@as(i32, @intCast(buf_width)), @max(left, right) + 1);
+        if (x_end <= x_start) continue;
+        const row = pixels[@as(usize, y) * stride ..];
+        fillSpan(row[@as(usize, @intCast(x_start))..@as(usize, @intCast(x_end))], color);
+    }
+}
+
 /// Alpha-blend an 8-bit coverage bitmap in `color` over the buffer.
 pub fn blitGlyph(
     pixels: []u32,
@@ -397,6 +448,27 @@ test "fillRect clips to a view while honoring framebuffer stride" {
     for ([_]usize{ 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14 }) |i| {
         try std.testing.expectEqual(untouched, pixels[i]);
     }
+}
+
+test "fillQuad fills a sheared rectangle span" {
+    const untouched: u32 = 0x12345678;
+    var pixels = [_]u32{untouched} ** (8 * 5);
+    // A rectangle sheared right: top edge narrower than the bottom edge.
+    const corners = [_][2]i32{
+        .{ 1, 0 }, // top-left
+        .{ 3, 0 }, // top-right
+        .{ 6, 4 }, // bottom-right
+        .{ 4, 4 }, // bottom-left
+    };
+    fillQuad(&pixels, 8, 8, 5, corners, 0xffabcdef);
+    // The interior widens toward the bottom.
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[0 * 8 + 2]);
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[4 * 8 + 5]);
+    // Outside the shear stays untouched; below the quad untouched.
+    try std.testing.expectEqual(untouched, pixels[0]);
+    try std.testing.expectEqual(untouched, pixels[4 * 8 + 0]);
+    // Bottom center is inside; the row is wide enough at the bottom.
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[4 * 8 + 4]);
 }
 
 test "blend endpoints" {
