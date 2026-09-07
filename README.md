@@ -194,6 +194,7 @@ and other actions are not yet supported. Search mode retains its own controls.
 | `Ctrl+Shift+F` | Search scrollback |
 | `Ctrl+Shift+N` | Open a new session (tab or window, per `new-window-mode`) |
 | `Ctrl+Shift+T` | Open a new tab |
+| `Ctrl+Shift+W` / `Ctrl+Shift+Q` | Close the active tab |
 | `Ctrl+Shift+H` / `Ctrl+Shift+L` | Previous / next tab |
 | `Ctrl+Shift+,` | Reload configuration |
 | `Shift+Up` / `Shift+Down` | Scroll up / down one line |

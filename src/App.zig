@@ -242,10 +242,7 @@ mouse_button: ?vt.input.MouseButton,
 /// Serial of the most recent input event, required to claim selections.
 last_serial: u32,
 clipboard: Clipboard,
-kitty_clipboard: KittyClipboard,
-/// The tab whose OSC 52 read is in flight, so the reply reaches the requester
-/// even if the active tab changes while the async clipboard read runs.
-osc52_read_owner: ?*Tab = null,
+next_tab_id: u64,
 const selection_word_boundaries = [_]u21{
     0,   ' ', '\t', '\'', '"',
     '│',
@@ -395,18 +392,15 @@ pub const AppStreamHandler = struct {
             .kitty_color_report => app.answerKittySelectionColorQueries(self.tab, value),
             .clipboard_contents => app.setOsc52Clipboard(self.tab, value.kind, value.data),
             .kitty_clipboard => {
-                // Record the requesting tab so the enqueued response is written
-                // back to it, not whichever tab happens to be active at dequeue.
-                app.kitty_clipboard.setOwner(@ptrCast(self.tab));
-                app.kitty_clipboard.handle(value) catch |err| {
+                self.tab.kitty_clipboard.handle(value) catch |err| {
                     if (err == error.QueueFull) {
-                        const response = app.kitty_clipboard.rejection();
+                        const response = self.tab.kitty_clipboard.rejection();
                         app.writeKittyClipboardStatus(self.tab, response.op, response.id, response.terminator, .EBUSY);
                     } else {
                         log.warn("failed to handle OSC 5522 command: {}", .{err});
                     }
                 };
-                app.pumpKittyClipboard();
+                app.pumpKittyClipboard(self.tab);
             },
             .show_desktop_notification => app.showDesktopNotification(value.title, value.body),
             .mouse_shape => {
@@ -437,7 +431,7 @@ pub const AppStreamHandler = struct {
                 app.syncCursorShape();
             },
             .full_reset => {
-                app.kitty_clipboard.reset();
+                self.tab.kitty_clipboard.reset();
                 self.tab.mouse_shape_explicit = false;
                 self.tab.in_band_reports = false;
                 app.syncCursorShape();
@@ -579,7 +573,7 @@ pub fn init(
     const self = try alloc.create(App);
     errdefer alloc.destroy(self);
 
-    const first_tab = try Tab.init(alloc, io, self, config, environ, path, argv, envp, .{
+    const first_tab = try Tab.init(alloc, io, self, 1, config, environ, path, argv, envp, .{
         .cols = startup_size.cols,
         .rows = startup_size.rows,
         .cell_width = font.cell_width,
@@ -707,7 +701,7 @@ pub fn init(
         .mouse_button = null,
         .last_serial = 0,
         .clipboard = .init(alloc, window.data_manager, window.primary_manager),
-        .kitty_clipboard = .init(alloc),
+        .next_tab_id = 2,
     };
 
     // Scope confirmation ran concurrently with the window setup above,
@@ -1066,6 +1060,7 @@ fn pipeBackedTab(alloc: std.mem.Allocator, master: posix.fd_t) *Tab {
         .alloc = alloc,
         .io = std.testing.io,
         .app = undefined,
+        .id = 1,
         .term = undefined,
         .stream = undefined,
         .pty = .{ .master = master, .slave = -1, .gate = -1 },
@@ -1076,6 +1071,7 @@ fn pipeBackedTab(alloc: std.mem.Allocator, master: posix.fd_t) *Tab {
         .write_queue_offset = 0,
         .search = null,
         .kitty_cache = .empty,
+        .kitty_clipboard = .init(alloc),
         .in_band_reports = false,
         .sync_output = false,
         .mouse_shape_explicit = false,
@@ -1549,7 +1545,6 @@ pub fn deinit(self: *App) void {
     if (self.hovered_link) |link| self.alloc.free(link.uri);
     if (self.link_press) |press| self.alloc.free(press.uri);
     self.clearImeText();
-    self.kitty_clipboard.deinit();
     self.clipboard.deinit();
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
@@ -1965,6 +1960,7 @@ fn newTab(self: *App) void {
         self.alloc,
         self.io,
         self,
+        self.next_tab_id,
         self.config,
         self.environ,
         self.child_path,
@@ -1981,6 +1977,7 @@ fn newTab(self: *App) void {
         log.err("new tab spawn failed: {}", .{err});
         return;
     };
+    self.next_tab_id += 1;
     // A new tab needs the response/side-effect handlers, not just the default
     // readonly ones, so its device queries, size reports and PTY replies reach
     // its own pty.
@@ -2030,6 +2027,12 @@ fn activateIndex(self: *App, index: usize) void {
     self.activateTab(self.tabs.items[index]);
 }
 
+/// Returns a live tab by its stable asynchronous-operation identity.
+fn findTab(self: *App, id: u64) ?*Tab {
+    for (self.tabs.items) |tb| if (tb.id == id) return tb;
+    return null;
+}
+
 fn nextTab(self: *App) void {
     self.activateIndex((self.activeIndex() + 1) % self.tabs.items.len);
 }
@@ -2039,12 +2042,13 @@ fn prevTab(self: *App) void {
     self.activateIndex((self.activeIndex() + len - 1) % len);
 }
 
-/// Ctrl+Shift+W: close the active tab, activating a neighbor. Closing the
+/// Ctrl+Shift+W/Q: close the active tab, activating a neighbor. Closing the
 /// last tab closes the window. The closed tab's state is freed immediately
 /// unless an async job is still borrowing its kitty image cache, in which
 /// case the deinit is deferred until the raster worker is idle.
 fn closeTab(self: *App) void {
     if (self.tabs.items.len <= 1) {
+        self.active.hangup();
         self.window.running = false;
         return;
     }
@@ -2055,9 +2059,10 @@ fn closeTab(self: *App) void {
         self.activateIndex(idx - 1);
     }
     const closing = self.tabs.orderedRemove(idx);
-    // Late clipboard responses must not reach a freed tab.
-    self.kitty_clipboard.forgetOwner(@ptrCast(closing));
-    if (self.osc52_read_owner == closing) self.osc52_read_owner = null;
+    // Stop the child immediately. Only cache/terminal destruction may wait
+    // for a raster snapshot; clipboard completions use the stable tab ID and
+    // will be discarded once this tab is absent from `tabs`.
+    closing.hangup();
     // Defer deinit while the raster worker is busy or the snapshot still pins
     // this tab's kitty cache. A deferred tab stays alive so the cache pointer
     // in the snapshot remains valid until it is released.
@@ -2780,28 +2785,23 @@ fn setOsc52Clipboard(self: *App, tb: *Tab, kind: u8, data: []const u8) void {
 }
 
 fn beginOsc52Read(self: *App, tb: *Tab, kind: u8) void {
-    // Record the requester so the reply reaches it even if the active tab
-    // changes before the Wayland clipboard read completes.
-    self.osc52_read_owner = tb;
     const target: Clipboard.Target = switch (osc52Target(kind)) {
         .clipboard => .clipboard,
         .primary => .primary,
     };
-    switch (self.clipboard.request(target, .{ .osc52_read = kind })) {
+    switch (self.clipboard.request(target, .{ .osc52_read = .{ .tab_id = tb.id, .kind = kind } })) {
         .started => {},
-        .busy, .unavailable => self.writeOsc52ClipboardReport(kind, ""),
+        .busy, .unavailable => self.writeOsc52ClipboardReport(tb, kind, ""),
     }
 }
 
-fn writeOsc52ClipboardReport(self: *App, kind: u8, data: []const u8) void {
+fn writeOsc52ClipboardReport(self: *App, tb: *Tab, kind: u8, data: []const u8) void {
     var writer: std.Io.Writer.Allocating = .init(self.alloc);
     defer writer.deinit();
     formatOsc52ClipboardReport(&writer.writer, kind, data) catch return;
     const response = writer.toOwnedSlice() catch return;
     defer self.alloc.free(response);
-    const owner = self.osc52_read_owner orelse self.tab();
-    self.osc52_read_owner = null;
-    owner.writePty(response);
+    tb.writePty(response);
 }
 
 fn formatOsc52ClipboardReport(writer: *std.Io.Writer, kind: u8, data: []const u8) !void {
@@ -3075,41 +3075,54 @@ test "busy OSC 52 read replies empty without disturbing the active transfer" {
     const alloc = std.testing.allocator;
     const linux = std.os.linux;
     var incoming: [2]posix.fd_t = undefined;
-    var output: [2]posix.fd_t = undefined;
+    var output_a: [2]posix.fd_t = undefined;
+    var output_b: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&incoming, .{ .CLOEXEC = true, .NONBLOCK = true })));
     try std.testing.expectEqual(@as(usize, 5), linux.write(incoming[1], "hello", 5));
     _ = linux.close(incoming[1]);
-    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
-    defer _ = linux.close(output[0]);
-    defer _ = linux.close(output[1]);
-    const tb = pipeBackedTab(alloc, output[1]);
-    defer alloc.destroy(tb);
-    defer tb.write_queue.deinit(alloc);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output_a, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output_a[0]);
+    defer _ = linux.close(output_a[1]);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output_b, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output_b[0]);
+    defer _ = linux.close(output_b[1]);
+    const tab_a = pipeBackedTab(alloc, output_a[1]);
+    defer alloc.destroy(tab_a);
+    defer tab_a.kitty_clipboard.deinit();
+    defer tab_a.write_queue.deinit(alloc);
+    const tab_b = pipeBackedTab(alloc, output_b[1]);
+    defer alloc.destroy(tab_b);
+    defer tab_b.kitty_clipboard.deinit();
+    defer tab_b.write_queue.deinit(alloc);
+    tab_b.id = 2;
     const app = try alloc.create(App);
     defer alloc.destroy(app);
     app.alloc = alloc;
-    app.active = tb;
+    app.active = tab_a;
     app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    try app.tabs.append(alloc, tab_a);
+    try app.tabs.append(alloc, tab_b);
     app.clipboard = .init(alloc, null, null);
     defer app.clipboard.deinit();
     app.clipboard.transfer_fd = incoming[0];
-    app.clipboard.transfer_action = .{ .osc52_read = 'c' };
+    app.clipboard.transfer_action = .{ .osc52_read = .{ .tab_id = tab_a.id, .kind = 'c' } };
 
-    app.beginOsc52Read(tb, 'p');
+    app.beginOsc52Read(tab_b, 'p');
     var buf: [64]u8 = undefined;
-    const busy_len = try posix.read(output[0], &buf);
+    const busy_len = try posix.read(output_b[0], &buf);
     try std.testing.expectEqualStrings("\x1b]52;p;\x07", buf[0..busy_len]);
     try std.testing.expectEqual(incoming[0], app.clipboard.transferFd());
-    try std.testing.expectEqual(@as(?u8, 'c'), app.clipboard.osc52ReadKind());
+    try std.testing.expectEqual(@as(?u8, 'c'), app.clipboard.osc52Read().?.kind);
 
     const event = (try app.clipboard.readTransfer()).?;
     try std.testing.expectEqual(@as(u8, 'c'), event.osc52_read.kind);
     try std.testing.expectEqualStrings("hello", event.osc52_read.data);
-    app.writeOsc52ClipboardReport(event.osc52_read.kind, event.osc52_read.data);
+    app.writeOsc52ClipboardReport(tab_a, event.osc52_read.kind, event.osc52_read.data);
     app.clipboard.finishEvent();
-    const completed_len = try posix.read(output[0], &buf);
+    const completed_len = try posix.read(output_a[0], &buf);
     try std.testing.expectEqualStrings("\x1b]52;c;aGVsbG8=\x07", buf[0..completed_len]);
-    try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
+    try std.testing.expectError(error.WouldBlock, posix.read(output_b[0], &buf));
 }
 
 test "PNG decode rejects oversized dimensions before rasterization" {
@@ -4009,11 +4022,12 @@ fn beginPaste(self: *App, target: Clipboard.Target) void {
 }
 
 fn expireClipboardTransfers(self: *App) void {
-    const osc52_kind = self.clipboard.osc52ReadKind();
+    const osc52_read = self.clipboard.osc52Read();
+    const kitty_read_tab_id = self.clipboard.kittyReadTabId();
     if (!self.clipboard.expireTransfers()) return;
-    if (osc52_kind) |kind| self.writeOsc52ClipboardReport(kind, "");
-    self.failStartedKittyRead(.EIO);
-    self.pumpKittyClipboard();
+    if (osc52_read) |read| if (self.findTab(read.tab_id)) |tb| self.writeOsc52ClipboardReport(tb, read.kind, "");
+    self.failStartedKittyRead(kitty_read_tab_id, .EIO);
+    self.pumpKittyClipboards();
 }
 
 test "expired Kitty read fails and unblocks the next queued request" {
@@ -4028,26 +4042,28 @@ test "expired Kitty read fails and unblocks the next queued request" {
     defer _ = linux.close(output[1]);
     const tb = pipeBackedTab(alloc, output[1]);
     defer alloc.destroy(tb);
+    defer tb.kitty_clipboard.deinit();
     defer tb.write_queue.deinit(alloc);
     const app = try alloc.create(App);
     defer alloc.destroy(app);
     app.alloc = alloc;
     app.active = tb;
     app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    try app.tabs.append(alloc, tb);
     app.clipboard = .init(alloc, null, null);
     defer app.clipboard.deinit();
-    app.kitty_clipboard = .init(alloc);
-    defer app.kitty_clipboard.deinit();
     app.clipboard.transfer_fd = incoming[0];
     app.clipboard.transfer_deadline_ms = 0;
-    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=first", .payload = "dGV4dC9wbGFpbg==", .terminator = .st });
-    app.kitty_clipboard.front().?.read.started = true;
-    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=second", .payload = "Lg==", .terminator = .st });
+    app.clipboard.transfer_action = .{ .kitty_read = .{ .tab_id = tb.id, .mime = "text/plain" } };
+    try tb.kitty_clipboard.handle(.{ .metadata = "type=read:id=first", .payload = "dGV4dC9wbGFpbg==", .terminator = .st });
+    tb.kitty_clipboard.front().?.read.started = true;
+    try tb.kitty_clipboard.handle(.{ .metadata = "type=read:id=second", .payload = "Lg==", .terminator = .st });
 
     app.expireClipboardTransfers();
     try std.testing.expectEqual(@as(posix.fd_t, -1), app.clipboard.transferFd());
-    try std.testing.expect(app.kitty_clipboard.front() == null);
-    try std.testing.expectEqual(@as(usize, 0), app.kitty_clipboard.retained_bytes);
+    try std.testing.expect(tb.kitty_clipboard.front() == null);
+    try std.testing.expectEqual(@as(usize, 0), tb.kitty_clipboard.retained_bytes);
     var buf: [1024]u8 = undefined;
     const n = try posix.read(output[0], &buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "status=EIO") != null);
@@ -4057,15 +4073,16 @@ test "expired Kitty read fails and unblocks the next queued request" {
 }
 
 fn readClipboardTransfer(self: *App) void {
-    const osc52_kind = self.clipboard.osc52ReadKind();
+    const osc52_read = self.clipboard.osc52Read();
+    const kitty_read_tab_id = self.clipboard.kittyReadTabId();
     const event = self.clipboard.readTransfer() catch |err| {
         log.warn("clipboard transfer failed: {}", .{err});
-        if (osc52_kind) |kind| self.writeOsc52ClipboardReport(kind, "");
-        self.failStartedKittyRead(.EIO);
-        self.pumpKittyClipboard();
+        if (osc52_read) |read| if (self.findTab(read.tab_id)) |tb| self.writeOsc52ClipboardReport(tb, read.kind, "");
+        self.failStartedKittyRead(kitty_read_tab_id, .EIO);
+        self.pumpKittyClipboards();
         return;
     } orelse return;
-    defer self.pumpKittyClipboard();
+    defer self.pumpKittyClipboards();
     defer self.clipboard.finishEvent();
     switch (event) {
         .terminal => |paste| self.writeTerminalPaste(
@@ -4073,16 +4090,17 @@ fn readClipboardTransfer(self: *App) void {
             paste.mime,
             paste.data,
         ),
-        .osc52_read => |read| self.writeOsc52ClipboardReport(read.kind, read.data),
+        .osc52_read => |read| if (self.findTab(read.tab_id)) |tb| self.writeOsc52ClipboardReport(tb, read.kind, read.data),
         .kitty_read => |read| {
-            const request = switch (self.kitty_clipboard.front().?.*) {
+            const tb = self.findTab(read.tab_id) orelse return;
+            const request = switch (tb.kitty_clipboard.front().?.*) {
                 .read => |*request| request,
                 else => unreachable,
             };
             std.debug.assert(request.started);
             var available_buf: [clipboard_format.paste_mime_preference.len][]const u8 = undefined;
             self.finishKittyClipboardRead(
-                self.kittyResponder(),
+                tb,
                 request,
                 self.clipboard.availableMimes(clipboardTargetFromKitty(request.target), &available_buf),
                 .{ .mime = read.mime, .data = read.data },
@@ -4103,19 +4121,18 @@ fn readClipboardTransfer(self: *App) void {
 /// Start and retire committed OSC 5522 operations strictly from the FIFO
 /// head. Asynchronous reads stop the pump until their Wayland pipe reaches
 /// EOF; writes and metadata-only replies complete immediately in order.
-fn pumpKittyClipboard(self: *App) void {
-    while (self.kitty_clipboard.front()) |request| {
-        const owner = self.kittyResponder();
+fn pumpKittyClipboard(self: *App, tb: *Tab) void {
+    while (tb.kitty_clipboard.front()) |request| {
         switch (request.*) {
             .status => |*status| {
-                self.writeKittyClipboardStatus(owner, status.op, status.id, status.terminator, status.status);
-                self.kitty_clipboard.pop();
+                self.writeKittyClipboardStatus(tb, status.op, status.id, status.terminator, status.status);
+                tb.kitty_clipboard.pop();
             },
             .write => |*write| {
-                self.kitty_clipboard.prepareWrite(write);
+                tb.kitty_clipboard.prepareWrite(write);
                 const target = clipboardTarget(write.committed.loc) orelse {
-                    self.writeKittyClipboardStatus(owner, .write, write.committed.id, write.terminator, .ENOSYS);
-                    self.kitty_clipboard.pop();
+                    self.writeKittyClipboardStatus(tb, .write, write.committed.id, write.terminator, .ENOSYS);
+                    tb.kitty_clipboard.pop();
                     continue;
                 };
                 const status: vt.kitty.clipboard.Status = if (write.committed.contents.len == 0)
@@ -4127,25 +4144,25 @@ fn pumpKittyClipboard(self: *App) void {
                     const owned = self.alloc.dupeZ(u8, text) catch break :status .EIO;
                     break :status if (self.clipboard.claim(target, owned, self.last_serial)) .DONE else .ENOSYS;
                 };
-                self.writeKittyClipboardStatus(owner, .write, write.committed.id, write.terminator, status);
-                self.kitty_clipboard.pop();
+                self.writeKittyClipboardStatus(tb, .write, write.committed.id, write.terminator, status);
+                tb.kitty_clipboard.pop();
             },
             .read => |*read| {
                 if (read.started) return;
-                self.kitty_clipboard.prepareRead(read) catch {
-                    self.writeKittyClipboardStatus(owner, .read, read.id, read.terminator, .EIO);
-                    self.kitty_clipboard.pop();
+                tb.kitty_clipboard.prepareRead(read) catch {
+                    self.writeKittyClipboardStatus(tb, .read, read.id, read.terminator, .EIO);
+                    tb.kitty_clipboard.pop();
                     continue;
                 };
                 if (read.paste) |paste| {
                     const available = [_][]const u8{paste.mime};
-                    self.finishKittyClipboardRead(owner, read, &available, paste);
+                    self.finishKittyClipboardRead(tb, read, &available, paste);
                     continue;
                 }
                 if (!read.needsTransfer()) {
                     var available_buf: [clipboard_format.paste_mime_preference.len][]const u8 = undefined;
                     self.finishKittyClipboardRead(
-                        owner,
+                        tb,
                         read,
                         self.clipboard.availableMimes(clipboardTargetFromKitty(read.target), &available_buf),
                         null,
@@ -4153,14 +4170,14 @@ fn pumpKittyClipboard(self: *App) void {
                     continue;
                 }
 
-                switch (self.clipboard.request(clipboardTargetFromKitty(read.target), .kitty_read)) {
+                switch (self.clipboard.request(clipboardTargetFromKitty(read.target), .{ .kitty_read = tb.id })) {
                     .started => {
                         read.started = true;
                         return;
                     },
                     .busy => return,
                     .unavailable => {
-                        self.finishKittyClipboardRead(owner, read, &.{}, null);
+                        self.finishKittyClipboardRead(tb, read, &.{}, null);
                         continue;
                     },
                 }
@@ -4180,32 +4197,29 @@ fn finishKittyClipboardRead(
     defer writer.deinit();
     read.encodeSuccess(&writer.writer, available, content) catch {
         self.writeKittyClipboardStatus(owner, .read, read.id, read.terminator, .EIO);
-        self.kitty_clipboard.pop();
+        owner.kitty_clipboard.pop();
         return;
     };
     owner.writePty(writer.writer.buffered());
-    self.kitty_clipboard.pop();
+    owner.kitty_clipboard.pop();
 }
 
-fn failStartedKittyRead(self: *App, status: vt.kitty.clipboard.Status) void {
-    const request = self.kitty_clipboard.front() orelse return;
+fn failStartedKittyRead(self: *App, tab_id: ?u64, status: vt.kitty.clipboard.Status) void {
+    // The active transfer records its originating tab ID in Clipboard.
+    // A closed requester is intentionally not resurrected or redirected.
+    const owner = self.findTab(tab_id orelse return) orelse return;
+    const request = owner.kitty_clipboard.front() orelse return;
     const read = switch (request.*) {
         .read => |*read| read,
         else => return,
     };
     if (!read.started) return;
-    const owner = self.kittyResponder();
     self.writeKittyClipboardStatus(owner, .read, read.id, read.terminator, status);
-    self.kitty_clipboard.pop();
+    owner.kitty_clipboard.pop();
 }
 
-/// Tab that must receive the response for the current OSC 5522 request: the
-/// tab that enqueued it, or the active tab when the owner was a removed tab.
-fn kittyResponder(self: *App) *Tab {
-    if (self.kitty_clipboard.frontOwner()) |owner| {
-        return @ptrCast(@alignCast(owner));
-    }
-    return self.tab();
+fn pumpKittyClipboards(self: *App) void {
+    for (self.tabs.items) |tb| self.pumpKittyClipboard(tb);
 }
 
 fn writeKittyClipboardStatus(
@@ -4240,7 +4254,7 @@ fn writeTerminalPaste(
             const target = clipboardTarget(location) orelse return;
             var writer: std.Io.Writer.Allocating = .init(self.alloc);
             defer writer.deinit();
-            self.kitty_clipboard.paste(
+            self.tab().kitty_clipboard.paste(
                 self.io,
                 kittyClipboardTarget(target),
                 mime,
@@ -5369,6 +5383,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
                 'l' => return self.nextTab(),
                 'n' => return self.openNewSession(),
                 't' => return self.newTab(),
+                'q' => return self.closeTab(),
                 'w' => return self.closeTab(),
                 'v' => return self.beginPaste(.clipboard),
                 'x' => return self.jumpPrompt(1),
@@ -5442,7 +5457,7 @@ test "maximum clipboard response survives write backpressure in order" {
     try formatOsc52ClipboardReport(&expected.writer, 'c', clipboard);
     try expected.writer.writeAll("following input");
 
-    app.writeOsc52ClipboardReport('c', clipboard);
+    app.writeOsc52ClipboardReport(tb, 'c', clipboard);
     try std.testing.expect(tb.write_queue.items.len > 1024 * 1024);
     tb.writePty("following input");
     var received: usize = 0;

@@ -17,6 +17,7 @@ const Pty = @import("Pty.zig");
 const ReadPipeline = @import("ReadPipeline.zig");
 const ScrollbackSearch = @import("ScrollbackSearch.zig");
 const KittyImageCache = @import("KittyImageCache.zig");
+const KittyClipboard = @import("KittyClipboard.zig");
 
 const log = std.log.scoped(.tab);
 
@@ -36,6 +37,8 @@ fn tmpDirPath(environ: std.process.Environ) []const u8 {
 /// Owned session state for a single tab. The terminal is the source of
 /// truth for content; `render_state` is derived from it in App.
 alloc: std.mem.Allocator,
+/// Stable identity used by App's asynchronous clipboard broker.
+id: u64,
 io: std.Io,
 app: *App,
 term: vt.Terminal,
@@ -51,6 +54,8 @@ write_queue_offset: usize = 0,
 search: ?ScrollbackSearch,
 /// Pinned copies of kitty image data shared between consecutive async jobs.
 kitty_cache: KittyImageCache,
+/// OSC 5522 transaction state belongs to this terminal session.
+kitty_clipboard: KittyClipboard,
 /// Cached DEC mode 2048 state, to detect the application enabling
 /// in-band size reports.
 in_band_reports: bool,
@@ -82,6 +87,7 @@ pub fn init(
     alloc: std.mem.Allocator,
     io: std.Io,
     app: *App,
+    id: u64,
     config: Config,
     environ: std.process.Environ,
     path: [*:0]const u8,
@@ -137,6 +143,7 @@ pub fn init(
         .alloc = alloc,
         .io = io,
         .app = app,
+        .id = id,
         .term = term,
         .stream = undefined,
         .pty = pty,
@@ -146,6 +153,7 @@ pub fn init(
         .write_queue = .empty,
         .search = null,
         .kitty_cache = .empty,
+        .kitty_clipboard = .init(alloc),
         .in_band_reports = false,
         .sync_output = false,
         .mouse_shape_explicit = false,
@@ -194,6 +202,7 @@ pub fn deinit(self: *Tab) void {
     self.pty.deinit();
     if (self.search) |*search| search.deinit(self.alloc, &self.term);
     self.kitty_cache.deinit(self.alloc);
+    self.kitty_clipboard.deinit();
     self.write_queue.deinit(self.alloc);
     self.stream.deinit();
     self.term.deinit(self.alloc);
