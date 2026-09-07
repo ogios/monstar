@@ -73,6 +73,16 @@ cursor_text: ?Config.TerminalColor,
 /// overlay handles both the fill and the glyph recolor, so a gliding
 /// cursor correctly smears across intermediate cells.
 cursor_overlay: ?CursorOverlay = null,
+/// Inclusive grid-local row band that must be repainted alongside the
+/// dirty rows before the cursor overlay is composited, clearing the
+/// cells a gliding cursor vacated. `min > max` means no forced rows.
+/// Set by the cursor overlay's partial-render path.
+cursor_force_row_min: usize = std.math.maxInt(usize),
+cursor_force_row_max: usize = 0,
+/// The cursor quad drawn by the previous frame, so the next partial
+/// cursor render can repaint the rows it vacated. Cleared when the
+/// overlay is not drawn (settled or native cursor).
+last_cursor_quad: ?CursorOverlay = null,
 /// Alpha applied to the default terminal background and window padding.
 background_alpha: u8,
 /// Whether background alpha also applies to explicit terminal cell
@@ -437,9 +447,10 @@ pub fn renderDirty(
     const all_selections = rows.items(.selection);
     const all_dirty = rows.items(.dirty);
     var rendered_until: usize = 0;
-    for (all_dirty[0..state.rows], 0..) |dirty, y| {
-        if (!dirty) continue;
-        if (self.partial_cell_raster and self.cell_damage_tracker.damageForRow(y) == null) continue;
+    for (0..state.rows) |y| {
+        const is_forced = self.cursorForceRow(y);
+        if (!all_dirty[y] and !is_forced) continue;
+        if (self.partial_cell_raster and !is_forced and self.cell_damage_tracker.damageForRow(y) == null) continue;
         const expand_up = y > 0 and
             (self.font.neighbor_row_overhang or self.row_overhang.isSet(y));
         const expand_down = y + 1 < state.rows and
@@ -448,7 +459,7 @@ pub fn renderDirty(
         const end = y + 1 + @intFromBool(expand_down);
         var row = @max(start, rendered_until);
         while (row < end) : (row += 1) {
-            const cell_damage = if (self.partial_cell_raster and
+            const cell_damage = if (self.partial_cell_raster and !is_forced and
                 row == y and start == y and end == y + 1)
                 self.cell_damage_tracker.damageForRow(y)
             else
@@ -480,6 +491,15 @@ pub fn renderDirty(
         }
         rendered_until = @max(rendered_until, end);
     }
+}
+
+/// Whether `y` falls in the cursor force-row band. The band repaints the
+/// rows a gliding cursor quad crossed so its vacated pixels are cleared
+/// before the new quad is composited on top. A band wider than the grid
+/// rows (min > max) forces nothing.
+fn cursorForceRow(self: *const Renderer, y: usize) bool {
+    return self.cursor_force_row_min <= self.cursor_force_row_max and
+        y >= self.cursor_force_row_min and y <= self.cursor_force_row_max;
 }
 
 fn recordRenderedRect(
@@ -729,6 +749,10 @@ pub fn renderCursorOverlay(
     width: u31,
     height: u31,
 ) !void {
+    // Remember the quad just drawn so the next partial cursor render can
+    // repaint the rows it vacated. Clearing to null when the overlay is
+    // absent lets a settle/full frame drop stale force rows.
+    self.last_cursor_quad = self.cursor_overlay;
     const overlay = self.cursor_overlay orelse return;
     if (!state.cursor.visible) return;
     const colors = &state.colors;
