@@ -11,6 +11,11 @@ const clipboard = vt.kitty.clipboard;
 
 alloc: std.mem.Allocator,
 queue: std.ArrayList(Request) = .empty,
+/// Source owner (an opaque `*Tab`) of the command being enqueued, so responses
+/// reach the requesting tab rather than whichever tab is active at dequeue.
+pending_owner: ?*anyopaque = null,
+/// Owners parallel to `queue`: responses go to the tab that enqueued each item.
+owners: std.ArrayList(?*anyopaque) = .empty,
 write_state: ?*clipboard.WriteState = null,
 paste_grants: std.ArrayList(PasteGrant) = .empty,
 retained_bytes: usize = 0,
@@ -149,8 +154,29 @@ pub fn deinit(self: *KittyClipboard) void {
     self.abortWrite();
     for (self.queue.items) |*request| request.deinit(self.alloc);
     self.queue.deinit(self.alloc);
+    self.owners.deinit(self.alloc);
     for (self.paste_grants.items) |*grant| grant.deinit();
     self.paste_grants.deinit(self.alloc);
+}
+
+/// Set the source tab for the next command handed to `handle`. Responses for
+/// the enqueued item are written back to this owner at dequeue time.
+pub fn setOwner(self: *KittyClipboard, owner: ?*anyopaque) void {
+    self.pending_owner = owner;
+}
+
+/// Owner of the FIFO front, or null when the queue is empty.
+pub fn frontOwner(self: *const KittyClipboard) ?*anyopaque {
+    if (self.queue.items.len == 0) return null;
+    return self.owners.items[0];
+}
+
+/// Drop ownership of every queued item for a closing tab, so late responses
+/// fall back to the active tab instead of a freed tab.
+pub fn forgetOwner(self: *KittyClipboard, owner: *anyopaque) void {
+    for (self.owners.items) |*item| {
+        if (item.* == owner) item.* = null;
+    }
 }
 
 pub fn reset(self: *KittyClipboard) void {
@@ -209,6 +235,7 @@ pub fn pop(self: *KittyClipboard) void {
     var request = self.queue.orderedRemove(0);
     self.retained_bytes -= request.retainedBytes();
     request.deinit(self.alloc);
+    _ = self.owners.orderedRemove(0);
 }
 
 /// Consume a read grant only when this request reaches the FIFO head. This
@@ -324,6 +351,8 @@ fn enqueueRead(
         self.setRejection(.read, meta.id, terminator);
         return err;
     };
+    try self.owners.append(self.alloc, self.pending_owner);
+    errdefer _ = self.owners.pop();
     try self.queue.append(self.alloc, .{
         .read = .{
             .target = target,
@@ -427,12 +456,18 @@ fn commitWrite(
         self.abortWrite();
         return err;
     };
+    self.owners.append(self.alloc, self.pending_owner) catch |err| {
+        committed.deinit(self.alloc);
+        self.abortWrite();
+        return err;
+    };
     self.queue.append(self.alloc, .{ .write = .{
         .state = state,
         .committed = committed,
         .terminator = terminator,
         .retained_bytes = retained_bytes,
     } }) catch |err| {
+        _ = self.owners.pop();
         self.abortWrite();
         return err;
     };
@@ -454,6 +489,8 @@ fn finishWriteStatus(
         self.setRejection(.write, state.id, terminator);
         return err;
     };
+    try self.owners.append(self.alloc, self.pending_owner);
+    errdefer _ = self.owners.pop();
     try self.queue.append(self.alloc, .{ .status = .{
         .op = .write,
         .status = status,

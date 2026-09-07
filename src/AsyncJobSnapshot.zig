@@ -18,15 +18,19 @@ hyperlink_hints: bool = false,
 tab_bar: []Renderer.TabBarItem = &.{},
 tab_bar_height: u31 = 0,
 kitty: []Renderer.KittyRenderItem = &.{},
+/// The cache that owns the pinned kitty items above. The active tab can change
+/// while a job is in flight, so release must return pins to this owner, never
+/// the currently-active tab's cache.
+kitty_cache: ?*KittyImageCache = null,
 
-pub fn deinit(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
+pub fn deinit(self: *AsyncJobSnapshot, alloc: std.mem.Allocator) void {
     if (self.preedit) |value| alloc.free(value);
     if (self.link_hint) |value| alloc.free(value);
     if (self.search) |value| alloc.free(value);
     for (self.tab_bar) |item| alloc.free(item.title);
     alloc.free(self.tab_bar);
     self.search_matches.deinit(alloc);
-    self.releaseKitty(alloc, cache);
+    self.releaseKitty(alloc);
 }
 
 pub fn replaceOverlays(
@@ -84,10 +88,16 @@ pub fn replaceTabBar(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, items: [
     self.tab_bar_height = height;
 }
 
-pub fn releaseKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
-    for (self.kitty) |item| cache.release(item.image.id, item.image.generation);
+/// Drop the pinned kitty pins against the cache that owns them and free the
+/// owned render items. `kitty_cache` is null when there is nothing to release.
+pub fn releaseKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator) void {
+    if (self.kitty_cache) |cache| {
+        for (self.kitty) |item| cache.release(item.image.id, item.image.generation);
+        cache.sweep(alloc);
+    }
     alloc.free(self.kitty);
     self.kitty = &.{};
+    self.kitty_cache = null;
 }
 
 pub fn replaceKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache, items: []Renderer.KittyRenderItem) !void {
@@ -98,6 +108,10 @@ pub fn replaceKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *K
         item.image.data = .{ .complete = try cache.acquire(alloc, item.image) };
         acquired += 1;
     }
-    self.releaseKitty(alloc, cache);
+    // Release the previous pins against the cache that owns them; the active
+    // tab may differ after a switch, so never use the current tab's cache.
+    self.releaseKitty(alloc);
     self.kitty = items;
+    self.kitty_cache = if (items.len > 0) cache else null;
+    if (items.len > 0) cache.sweep(alloc);
 }
