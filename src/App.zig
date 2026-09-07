@@ -5511,8 +5511,13 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         const cursor_was_animating = self.cursor_anim_moving;
         self.syncCursorAnimator();
         // Advance the trail once per produced frame so it stays locked to the
-        // compositor's refresh rather than sampling on a fixed nanosecond timer.
-        self.advanceCursorAnimation(cursor_was_animating);
+        // compositor's refresh rather than sampling on a fixed nanosecond
+        // timer. Guard on readiness and on an active or pending jump: with no
+        // movement the animator is disabled/unsupported and advance() would
+        // read an uninitialized quad.
+        if (self.cursor_anim_ready and (self.cursor_anim_moving or self.cursor_anim.jumped)) {
+            self.advanceCursorAnimation(cursor_was_animating);
+        }
         // If terminal state (rather than the fade timer) removed the last
         // overlay, redraw its old pixels instead of repairing from a buffer
         // that still contains the thumb.

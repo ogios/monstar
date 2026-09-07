@@ -89,55 +89,6 @@ pub const Corner = struct {
     /// Animation length for the current jump; derived from alignment.
     animation_length: f32 = 0,
 
-    /// Grid-pixel destination of this corner from the cursor center.
-    fn getDestination(
-        self: *const Corner,
-        center: [2]f32,
-        dims: [2]f32,
-    ) [2]f32 {
-        return .{
-            center[0] + self.relative[0] * dims[0],
-            center[1] + self.relative[1] * dims[1],
-        };
-    }
-
-    /// How closely this corner aligns with the direction of travel, from
-    /// -1 (directly behind) to +1 (directly ahead). Corners ahead move
-    /// faster (leading edge); corners behind lag (trailing edge).
-    fn directionAlignment(self: *const Corner, center: [2]f32, dims: [2]f32) f32 {
-        const corner_destination = self.getDestination(center, dims);
-        var corner_direction = self.relative;
-        normalize(&corner_direction);
-        var travel: [2]f32 = .{
-            corner_destination[0] - self.previous_destination[0],
-            corner_destination[1] - self.previous_destination[1],
-        };
-        normalize(&travel);
-        return dot(travel, corner_direction);
-    }
-
-    /// Pick an animation length from leading/trailing alignment. Short
-    /// jumps (one or two cells) use the fast short duration.
-    fn jumpAnimationLength(
-        self: *const Corner,
-        settings: Settings,
-        center: [2]f32,
-        dims: [2]f32,
-        alignment: f32,
-    ) f32 {
-        const corner_destination = self.getDestination(center, dims);
-        const jump_vec: [2]f32 = .{
-            (corner_destination[0] - self.previous_destination[0]) / dims[0],
-            (corner_destination[1] - self.previous_destination[1]) / dims[1],
-        };
-        if (@abs(jump_vec[0]) <= 2.001 and @abs(jump_vec[1]) <= 0.001) {
-            return @min(settings.animation_length, settings.short_animation_length);
-        }
-        const leading = settings.animation_length * (1.0 - std.math.clamp(settings.trail_size, 0, 1));
-        const trailing = settings.animation_length;
-        return lerp(trailing, leading, alignment);
-    }
-
     /// Advance both springs by `dt`. Returns true while still moving.
     fn update(self: *Corner, dt: f32) bool {
         var animating = self.spring_x.update(dt, self.animation_length);
@@ -181,17 +132,28 @@ pub const Animator = struct {
             .destination = destination,
         };
         a.setShape(shape, dims, double_width);
-        // Snap corners to the initial destination so the first frame does
-        // not animate in from the origin.
-        const dest_center: [2]f32 = .{
-            destination[0] + dims[0] * 0.5,
-            destination[1] + dims[1] * 0.5,
-        };
-        for (&a.corners) |*c| {
-            c.current = c.getDestination(dest_center, a.dims);
-            c.previous_destination = c.current;
-        }
+        // setShape re-baselines the corners onto the new geometry, so the first
+        // frame never animates in from the origin and a wide block seeds its
+        // corners across both cells.
         return a;
+    }
+
+    /// Snap every corner onto the current destination with the active shape,
+    /// clear the springs and motion flags. Used for the initial seed, an
+    /// immediate retarget, and a shape change so corners never linger in the
+    /// previous geometry (overlay shape and corner trail would otherwise
+    /// disagree for the rest of a jump).
+    fn snapToDestination(self: *Animator) void {
+        for (&self.corners) |*c| {
+            const cd = self.cornerDestination(c);
+            c.current = cd;
+            c.previous_destination = cd;
+            c.spring_x.reset();
+            c.spring_y.reset();
+            c.animation_length = 0;
+        }
+        self.jumped = false;
+        self.animating = false;
     }
 
     pub fn setShape(self: *Animator, shape: Shape, dims: [2]f32, double_width: bool) void {
@@ -214,6 +176,10 @@ pub const Animator = struct {
                 },
             };
         }
+        // Re-baseline onto the new footprint; a shape change fired mid-jump
+        // must not leave the four corners still gliding to old-shape corners
+        // (the overlay already renders the new shape).
+        self.snapToDestination();
     }
 
     /// Effective pixel width; block doubles on a wide character.
@@ -227,6 +193,53 @@ pub const Animator = struct {
             self.destination[0] + self.width() * 0.5,
             self.destination[1] + self.dims[1] * 0.5,
         };
+    }
+
+    /// Grid-pixel destination of a corner from the cursor center, using the
+    /// effective width so a wide block spans both cells on the first frame.
+    fn cornerDestination(self: *const Animator, corner: *const Corner) [2]f32 {
+        const c = self.center();
+        return .{
+            c[0] + corner.relative[0] * self.width(),
+            c[1] + corner.relative[1] * self.dims[1],
+        };
+    }
+
+    /// How closely a corner aligns with the direction of travel, from -1
+    /// (directly behind) to +1 (directly ahead). Corners ahead move faster
+    /// (leading edge); corners behind lag (trailing edge).
+    fn directionAlignment(self: *const Animator, corner: *const Corner) f32 {
+        const corner_destination = self.cornerDestination(corner);
+        var corner_direction = corner.relative;
+        normalize(&corner_direction);
+        var travel: [2]f32 = .{
+            corner_destination[0] - corner.previous_destination[0],
+            corner_destination[1] - corner.previous_destination[1],
+        };
+        normalize(&travel);
+        return dot(travel, corner_direction);
+    }
+
+    /// Pick an animation length from leading/trailing alignment. Short
+    /// jumps (one or two cells) use the fast short duration.
+    fn jumpAnimationLength(
+        self: *const Animator,
+        corner: *const Corner,
+        settings: Settings,
+        alignment: f32,
+    ) f32 {
+        const corner_destination = self.cornerDestination(corner);
+        const jump_vec: [2]f32 = .{
+            (corner_destination[0] - corner.previous_destination[0]) / self.width(),
+            (corner_destination[1] - corner.previous_destination[1]) / self.dims[1],
+        };
+        const cells = @max(@abs(jump_vec[0]), @abs(jump_vec[1]));
+        if (cells <= 2.001) {
+            return @min(settings.animation_length, settings.short_animation_length);
+        }
+        const leading = settings.animation_length * (1.0 - std.math.clamp(settings.trail_size, 0, 1));
+        const trailing = settings.animation_length;
+        return lerp(trailing, leading, alignment);
     }
 
     /// Retarget toward `destination` (top-left of the new cell). Detects the
@@ -245,16 +258,23 @@ pub const Animator = struct {
         self.destination = destination;
         self.dims = dims;
         self.double_width = double_width;
-        if (immediate or !moved) return;
 
-        const cur_dims: [2]f32 = .{ self.width(), self.dims[1] };
-        const dest_center = self.center();
+        // An immediate retarget (cursor hidden, unfocused, reduced-motion, or
+        // the config flag disabled) snaps every corner onto its destination and
+        // clears the springs so no stale quad or false jump survives. The plain
+        // no-change path (syncCursorAnimator calls setDestination every frame)
+        // must leave an in-flight trail untouched.
+        if (immediate) {
+            self.snapToDestination();
+            return;
+        }
+        if (!moved) return;
 
         var alignments: [4]f32 = undefined;
         var min: f32 = std.math.inf(f32);
         var max: f32 = -std.math.inf(f32);
         for (&self.corners, 0..) |c, i| {
-            alignments[i] = c.directionAlignment(dest_center, cur_dims);
+            alignments[i] = self.directionAlignment(&c);
             min = @min(min, alignments[i]);
             max = @max(max, alignments[i]);
         }
@@ -262,12 +282,12 @@ pub const Animator = struct {
         for (&self.corners, 0..) |*c, i| {
             var alignment: f32 = if (range == 0) 1.0 else (alignments[i] - min) / range;
             alignment = std.math.clamp(alignment, 0, 1);
-            c.animation_length = c.jumpAnimationLength(settings, dest_center, cur_dims, alignment);
+            c.animation_length = self.jumpAnimationLength(c, settings, alignment);
         }
 
         // Seed springs from the gap to each corner's new destination.
         for (&self.corners) |*c| {
-            const cd = c.getDestination(dest_center, cur_dims);
+            const cd = self.cornerDestination(c);
             if (cd[0] != c.previous_destination[0] or cd[1] != c.previous_destination[1]) {
                 c.spring_x.position = cd[0] - c.current[0];
                 c.spring_y.position = cd[1] - c.current[1];
@@ -359,4 +379,73 @@ test "long jump stretches the trail then settles" {
     // The spring must converge within the 4-second cap.
     try std.testing.expect(frames < 240);
     try std.testing.expect(a.settled());
+}
+
+test "wide block initializes to the doubled cell width" {
+    const a = Animator.init(.block, .{ 8, 16 }, true, .{ 32, 5 });
+    // Effective width is dims[0]*2 = 16: corners span x from 32 to 48.
+    try std.testing.expectApproxEqAbs(@as(f32, 32.0), a.corners[0].current[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 48.0), a.corners[1].current[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 48.0), a.corners[2].current[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 32.0), a.corners[3].current[0], 0.001);
+    // Vertically unchanged (single cell height).
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), a.corners[0].current[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 21.0), a.corners[2].current[1], 0.001);
+}
+
+test "no-destination-change frame leaves a moving trail untouched" {
+    var a = Animator.init(.block, .{ 8, 16 }, false, .{ 0, 0 });
+    a.setDestination(.{ 80, 0 }, .{ 8, 16 }, false, .{}, false);
+    try std.testing.expect(!a.settled());
+    const moving = a.corners[0].current[0];
+    // syncCursorAnimator re-resolves the same cell every frame while the
+    // trail is in flight; that call must not snap the trail to the target.
+    a.setDestination(.{ 80, 0 }, .{ 8, 16 }, false, .{}, false);
+    try std.testing.expect(!a.settled());
+    try std.testing.expectApproxEqAbs(moving, a.corners[0].current[0], 0.001);
+}
+
+test "immediate snap leaves the animator settled at the new cell" {
+    var a = Animator.init(.block, .{ 8, 16 }, false, .{ 0, 0 });
+    a.setDestination(.{ 80, 0 }, .{ 8, 16 }, false, .{}, false);
+    try std.testing.expect(!a.settled());
+    a.setDestination(.{ 80, 0 }, .{ 8, 16 }, false, .{}, true);
+    try std.testing.expect(a.settled());
+    for (a.corners) |c| {
+        try std.testing.expectApproxEqAbs(c.previous_destination[0], c.current[0], 0.001);
+        try std.testing.expectApproxEqAbs(c.previous_destination[1], c.current[1], 0.001);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 80.0), a.corners[0].current[0], 0.001);
+}
+
+test "vertical one-row jump uses the short animation length" {
+    var a = Animator.init(.block, .{ 8, 16 }, false, .{ 0, 0 });
+    const settings: Settings = .{ .animation_length = 0.150, .short_animation_length = 0.040 };
+    // A single-row vertical move is a short "one or two cells" jump; it must
+    // not fall through to the long 150ms duration.
+    a.setDestination(.{ 0, 16 }, .{ 8, 16 }, false, settings, false);
+    for (a.corners) |c| {
+        try std.testing.expect(c.animation_length <= 0.041);
+    }
+}
+
+test "setShape mid-jump re-baselines corners onto the new footprint" {
+    var a = Animator.init(.block, .{ 8, 16 }, false, .{ 0, 0 });
+    a.setDestination(.{ 80, 0 }, .{ 8, 16 }, false, .{}, false);
+    try std.testing.expect(!a.settled());
+    // DECSCUSR switches block -> bar while the quad is still gliding. The
+    // corners must land on the bar footprint rather than finish the jump as a
+    // block that the overlay already renders as a bar.
+    a.setShape(.bar, .{ 8, 16 }, false);
+    try std.testing.expect(a.settled());
+    // Every corner sits on its destination along the bar geometry.
+    for (a.corners) |c| {
+        try std.testing.expectApproxEqAbs(c.previous_destination[0], c.current[0], 0.001);
+        try std.testing.expectApproxEqAbs(c.previous_destination[1], c.current[1], 0.001);
+    }
+    // Horizontally narrowed to the bar width (8/8 = 1px), not the 8px block
+    // the trail was flying with; corners no longer span the full cell.
+    const bar_width = @as(f32, @floatFromInt(8)) * default_bar_percentage;
+    try std.testing.expectApproxEqAbs(bar_width, a.corners[1].current[0] - a.corners[0].current[0], 0.001);
+    try std.testing.expectApproxEqAbs(bar_width, a.corners[2].current[0] - a.corners[3].current[0], 0.001);
 }
