@@ -1742,7 +1742,10 @@ pub fn run(self: *App) !void {
         self.syncTerminalVisibility();
 
         if (signal_fd.revents & posix.POLL.IN != 0) {
-            try self.drainSignals();
+            // Removing a tab shifts the poll slots below. Start over with a
+            // freshly wired set rather than apply this iteration's events to
+            // a different tab.
+            if (try self.drainSignals()) continue;
         }
 
         // Per-tab pty output and input. Only tabs wired at the top of this
@@ -1852,7 +1855,8 @@ fn hangupChild(self: *App) void {
 
 /// Signal events arrived. SIGCHLD is the only place the terminal decides
 /// the session is over; SIGUSR1 reloads process-local configuration.
-fn drainSignals(self: *App) !void {
+/// Drains process signals and returns whether reaping removed a tab.
+fn drainSignals(self: *App) !bool {
     var info: std.os.linux.signalfd_siginfo = undefined;
     var saw_sigchld = false;
     var saw_sigusr1 = false;
@@ -1866,14 +1870,23 @@ fn drainSignals(self: *App) !void {
         }
     }
     if (saw_sigusr1) self.reloadConfig();
+    var removed_tab = false;
     if (saw_sigchld) {
-        // Reap any tab whose session child has exited.
-        for (self.tabs.items) |tb| {
+        // Reap each exited session, then remove its tab. `orderedRemove`
+        // shifts the following tab into this index, so do not advance it.
+        var i: usize = 0;
+        while (i < self.tabs.items.len) {
+            const tb = self.tabs.items[i];
             if (try tb.tryWait()) {
                 try self.finishChildOutput(tb);
+                self.removeExitedTab(i);
+                removed_tab = true;
+                continue;
             }
+            i += 1;
         }
     }
+    return removed_tab;
 }
 
 /// Once wait4 confirms the session child is gone, join the gatherer, consume
@@ -1890,6 +1903,31 @@ fn finishChildOutput(self: *App, tb: *Tab) !void {
         self.needs_redraw = true;
         if (tb == self.active) self.syncPtyOutput(tb, true);
     }
+}
+
+/// Removes a reaped session tab after its final PTY bytes have been consumed.
+/// The last session ending closes the window; otherwise an exiting active tab
+/// selects an adjacent live tab.
+fn removeExitedTab(self: *App, idx: usize) void {
+    std.debug.assert(idx < self.tabs.items.len);
+    if (self.tabs.items.len == 1) {
+        const closing = self.tabs.orderedRemove(idx);
+        self.disposeClosedTab(closing);
+        self.window.running = false;
+        return;
+    }
+
+    if (self.tabs.items[idx] == self.active) {
+        if (idx + 1 < self.tabs.items.len) {
+            self.activateIndex(idx + 1);
+        } else {
+            self.activateIndex(idx - 1);
+        }
+    }
+    const closing = self.tabs.orderedRemove(idx);
+    self.disposeClosedTab(closing);
+    log.debug("session exited; closed tab ({d} remaining)", .{self.tabs.items.len});
+    self.requestFullAsyncRedraw();
 }
 
 fn reloadConfig(self: *App) void {
@@ -2063,6 +2101,14 @@ fn closeTab(self: *App) void {
     // for a raster snapshot; clipboard completions use the stable tab ID and
     // will be discarded once this tab is absent from `tabs`.
     closing.hangup();
+    self.disposeClosedTab(closing);
+    log.debug("closed tab ({d} remaining)", .{self.tabs.items.len});
+    self.requestFullAsyncRedraw();
+}
+
+/// Releases a removed tab now, unless the async raster worker still borrows
+/// its kitty cache through the current snapshot.
+fn disposeClosedTab(self: *App, closing: *Tab) void {
     // Defer deinit while the raster worker is busy or the snapshot still pins
     // this tab's kitty cache. A deferred tab stays alive so the cache pointer
     // in the snapshot remains valid until it is released.
@@ -2082,8 +2128,6 @@ fn closeTab(self: *App) void {
             }
         };
     }
-    log.debug("closed tab ({d} remaining)", .{self.tabs.items.len});
-    self.requestFullAsyncRedraw();
 }
 
 /// Deinit queued closed tabs once the raster worker is idle and the snapshot no
