@@ -696,10 +696,9 @@ pub fn renderPreedit(
         );
 
         const face_idx = self.font.faceForCodepoint(self.alloc, cp);
-        const face = self.font.face(face_idx);
-        const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
-        if (glyph_idx != 0) {
-            const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+        if (face_idx == Font.sprite_face_index) {
+            const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)));
+            self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
             blitGlyph(
                 pixels,
                 self.pixelStride(width),
@@ -712,6 +711,24 @@ pub fn renderPreedit(
                 false,
                 self.glyph_clip_x,
             );
+        } else {
+            const face = self.font.face(face_idx);
+            const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+            if (glyph_idx != 0) {
+                const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+                blitGlyph(
+                    pixels,
+                    self.pixelStride(width),
+                    width,
+                    height,
+                    g,
+                    @as(i32, x) * self.font.cell_width + g.bearing_x,
+                    baseline_y - g.bearing_y,
+                    argb(state.colors.foreground),
+                    false,
+                    self.glyph_clip_x,
+                );
+            }
         }
         try self.blitDecoration(.underline, x, y, argb(state.colors.foreground), pixels, width, height);
         x += span;
@@ -793,12 +810,29 @@ pub fn renderCursorOverlay(
     if (cp == 0 or cp == kitty_placeholder) return;
     const span: u31 = @min(2, glyph_constraints.cellSpan(raw));
     const face_idx = self.font.faceForCodepoint(self.alloc, cp);
+    const baseline_y: i32 = @as(i32, y) * self.font.cell_height + self.font.baseline;
+    if (face_idx == Font.sprite_face_index) {
+        const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(span));
+        self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
+        blitGlyph(
+            pixels,
+            self.pixelStride(width),
+            width,
+            height,
+            g,
+            @as(i32, @intCast(x)) * self.font.cell_width + g.bearing_x,
+            baseline_y - g.bearing_y,
+            argb(text),
+            false,
+            self.glyph_clip_x,
+        );
+        return;
+    }
     const face = self.font.face(face_idx);
     const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
     if (glyph_idx == 0) return;
     const g = try face.glyph(self.alloc, glyph_idx, @intCast(span), glyph_constraints.isSymbol(cp));
     self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
-    const baseline_y: i32 = @as(i32, y) * self.font.cell_height + self.font.baseline;
     blitGlyph(
         pixels,
         self.pixelStride(width),
@@ -939,10 +973,9 @@ fn renderTextOverlay(
         if (span == 0) continue;
 
         const face_idx = self.font.faceForCodepoint(self.alloc, cp);
-        const face = self.font.face(face_idx);
-        const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
-        if (glyph_idx != 0) {
-            const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+        if (face_idx == Font.sprite_face_index) {
+            const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)));
+            self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
             blitGlyph(
                 pixels,
                 self.pixelStride(width),
@@ -955,6 +988,24 @@ fn renderTextOverlay(
                 false,
                 self.glyph_clip_x,
             );
+        } else {
+            const face = self.font.face(face_idx);
+            const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+            if (glyph_idx != 0) {
+                const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+                blitGlyph(
+                    pixels,
+                    self.pixelStride(width),
+                    width,
+                    height,
+                    g,
+                    @as(i32, x) * self.font.cell_width + g.bearing_x,
+                    baseline_y - g.bearing_y,
+                    argb(fg),
+                    false,
+                    self.glyph_clip_x,
+                );
+            }
         }
         x += span;
     }
