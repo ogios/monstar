@@ -131,6 +131,8 @@ Other settings:
   `0` disables the protocol (default `320000000`).
 - **inertial-scrolling** — Whether finger scrolling continues with inertial
   motion after release (default `true`).
+- **new-window-mode** — How `Ctrl+Shift+N` opens a new session: `tab` (default)
+  starts a tab in the current window; `window` spawns an independent window.
 - **copy-highlight-duration** — Post-copy selection flash in milliseconds;
   `0` disables the flash (default `200`).
 - **keybind** — Repeatable Ghostty-style `trigger=action` bindings for line
@@ -190,7 +192,9 @@ and other actions are not yet supported. Search mode retains its own controls.
 | --- | --- |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
 | `Ctrl+Shift+F` | Search scrollback |
-| `Ctrl+Shift+N` | Open a new window in the current directory |
+| `Ctrl+Shift+N` | Open a new session (tab or window, per `new-window-mode`) |
+| `Ctrl+Shift+T` | Open a new tab |
+| `Ctrl+Shift+H` / `Ctrl+Shift+L` | Previous / next tab |
 | `Ctrl+Shift+,` | Reload configuration |
 | `Shift+Up` / `Shift+Down` | Scroll up / down one line |
 | `Shift+PageUp` / `Shift+PageDown` | Scroll back / forward one page |
@@ -220,9 +224,9 @@ state. Middle-click to paste the primary selection.
   opening uses Wayland activation tokens.
 - D-Bus session services provide desktop notifications and launcher progress.
   Notification actions can activate the terminal window.
-- Monstar launches new windows opened with `Ctrl+Shift+N` through the systemd
-  user manager. Optional transient scopes place each shell process tree in a
-  separate scope.
+- Monstar launches new windows opened with `Ctrl+Shift+N` when
+  `new-window-mode = window` through the systemd user manager. Optional
+  transient scopes place each shell process tree in a separate scope.
 - Wayland protocols provide fractional scaling, text-input-v3 IME, cursor
   shapes, clipboard and primary selection, server-side decorations, named app
   icons, activation, system bell, and translucent background blur support.

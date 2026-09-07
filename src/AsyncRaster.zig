@@ -64,6 +64,11 @@ pub const Job = struct {
     search_no_match: bool,
     /// Transient right-edge scrollback indicator in full-surface pixels.
     scrollbar: ?Renderer.ScrollbarThumb,
+    /// Tab-bar strip labels; non-null when a tab bar is shown. The strip
+    /// occupies the top `tab_bar_height` pixels of the surface.
+    tab_bar: ?[]const Renderer.TabBarItem,
+    /// Vertical extent of the tab-bar strip in pixels.
+    tab_bar_height: u31,
     /// Visible kitty placements, resolved on the main thread with image
     /// data repointed at cache-pinned copies; empty when no graphics are
     /// visible.
@@ -82,7 +87,7 @@ pub const Job = struct {
     fn hasOverlay(self: *const Job) bool {
         return self.preedit != null or self.link_hint != null or
             self.search != null or self.search_matches.len > 0 or
-            self.scrollbar != null or
+            self.scrollbar != null or self.tab_bar != null or
             self.kitty_items.len > 0;
     }
 };
@@ -532,6 +537,19 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
                 thumb,
             );
         }
+        if (job.tab_bar) |items| {
+            try self.renderer.renderTabBar(
+                job.pixels,
+                job.width,
+                job.height,
+                job.tab_bar_height,
+                items,
+                self.renderer.selection_bg,
+                self.renderer.selection_fg orelse self.state.colors.foreground,
+                self.state.colors.background,
+                self.state.colors.foreground,
+            );
+        }
         damage.* = .full;
         return;
     }
@@ -721,6 +739,8 @@ test "unchanged dirty rows report no damage" {
         .search = null,
         .search_no_match = false,
         .scrollbar = null,
+        .tab_bar = null,
+        .tab_bar_height = 0,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = null,
@@ -767,6 +787,8 @@ test "repair previous frame" {
         .search = null,
         .search_no_match = false,
         .scrollbar = null,
+        .tab_bar = null,
+        .tab_bar_height = 0,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = null,
@@ -839,6 +861,8 @@ test "scroll previous frame in place and from distinct source" {
         .search = null,
         .search_no_match = false,
         .scrollbar = null,
+        .tab_bar = null,
+        .tab_bar_height = 0,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = 1,

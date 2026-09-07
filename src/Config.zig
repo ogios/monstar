@@ -119,6 +119,9 @@ image_storage_limit: usize = 320 * 1000 * 1000,
 mouse_scroll_multiplier: MouseScrollMultiplier = .{},
 /// Whether finger scrolling continues with inertial motion after release.
 inertial_scrolling: bool = true,
+/// What Ctrl+Shift+N opens: a new tab in the current window (default), or an
+/// independent window registered with the user service manager.
+new_window_mode: NewWindowMode = .tab,
 /// User keybindings, backed by the config arena. Defaults are resolved separately.
 keybinds: std.ArrayList(keybind.Binding) = .empty,
 /// Duration of the post-copy selection flash in milliseconds; 0 disables it.
@@ -145,6 +148,9 @@ copy_highlight_foreground: ?vt.color.RGB = null,
 palette: [256]?vt.color.RGB = @splat(null),
 
 pub const LinuxCgroup = enum { never, always };
+
+/// How a new session is opened: as a tab (default) or a detached window.
+pub const NewWindowMode = enum { tab, window };
 
 /// Load the default config file, if any. Strings are allocated in `arena`
 /// and live as long as it does.
@@ -267,6 +273,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
             false
         else
             return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "new-window-mode")) {
+        self.new_window_mode = std.meta.stringToEnum(NewWindowMode, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "copy-highlight-duration")) {
         self.copy_highlight_duration = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "background-opacity")) {
@@ -545,6 +553,7 @@ test "defaults" {
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 3), config.mouse_scroll_multiplier.discrete);
     try std.testing.expect(config.inertial_scrolling);
+    try std.testing.expectEqual(NewWindowMode.tab, config.new_window_mode);
     try std.testing.expectEqual(@as(i16, -1), keybind.getEvent(config.keybinds.items, .{
         .key = .arrow_up,
         .mods = .{ .shift = true },
@@ -598,6 +607,7 @@ test "parse config" {
         \\keybind = ctrl+shift+k=scroll_page_lines:-5
         \\keybind = ctrl+shift+k=scroll_page_lines:invalid
         \\inertial-scrolling = false
+        \\new-window-mode = window
         \\copy-highlight-duration = 250
         \\background-opacity = 0.8
         \\background-blur = false
@@ -641,6 +651,7 @@ test "parse config" {
         .mods = .{ .alt = true },
     }).?.scroll_page_lines);
     try std.testing.expect(!config.inertial_scrolling);
+    try std.testing.expectEqual(NewWindowMode.window, config.new_window_mode);
     try std.testing.expectEqual(@as(u32, 250), config.copy_highlight_duration);
     try std.testing.expectEqual(@as(u8, 204), config.background_opacity);
     try std.testing.expect(!config.background_blur);
@@ -663,6 +674,18 @@ test "unknown override is rejected" {
     try std.testing.expectError(
         error.UnknownKey,
         config.applyOverride(std.testing.allocator, "font-famly=monospace"),
+    );
+}
+
+test "new-window-mode rejects invalid values" {
+    var config: Config = .{};
+    try std.testing.expectError(
+        error.InvalidValue,
+        config.applyOverride(std.testing.allocator, "new-window-mode=float"),
+    );
+    try std.testing.expectError(
+        error.InvalidValue,
+        config.applyOverride(std.testing.allocator, "new-window-mode="),
     );
 }
 

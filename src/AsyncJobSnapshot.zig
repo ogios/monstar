@@ -15,12 +15,16 @@ search_range: ?Renderer.LinkRange = null,
 search_matches: std.ArrayList(bool) = .empty,
 scrollbar: ?Renderer.ScrollbarThumb = null,
 hyperlink_hints: bool = false,
+tab_bar: []Renderer.TabBarItem = &.{},
+tab_bar_height: u31 = 0,
 kitty: []Renderer.KittyRenderItem = &.{},
 
 pub fn deinit(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
     if (self.preedit) |value| alloc.free(value);
     if (self.link_hint) |value| alloc.free(value);
     if (self.search) |value| alloc.free(value);
+    for (self.tab_bar) |item| alloc.free(item.title);
+    alloc.free(self.tab_bar);
     self.search_matches.deinit(alloc);
     self.releaseKitty(alloc, cache);
 }
@@ -60,6 +64,24 @@ pub fn replaceOverlays(
     self.search_matches = matches;
     self.scrollbar = scrollbar;
     self.hyperlink_hints = hyperlink_hints;
+}
+
+/// Replaces the owned tab-bar snapshot. On failure the existing snapshot is
+/// preserved.
+pub fn replaceTabBar(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, items: []const Renderer.TabBarItem, height: u31) !void {
+    const new_items = try alloc.dupe(Renderer.TabBarItem, items);
+    errdefer alloc.free(new_items);
+    var duped: usize = 0;
+    errdefer for (new_items[0..duped]) |item| alloc.free(item.title);
+    for (new_items, 0..) |*item, i| {
+        _ = i;
+        item.title = try alloc.dupe(u8, item.title);
+        duped += 1;
+    }
+    for (self.tab_bar) |item| alloc.free(item.title);
+    alloc.free(self.tab_bar);
+    self.tab_bar = new_items;
+    self.tab_bar_height = height;
 }
 
 pub fn releaseKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {

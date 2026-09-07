@@ -847,6 +847,99 @@ fn renderTextOverlay(
     }
 }
 
+/// One tab rendered in the tab bar strip.
+pub const TabBarItem = struct {
+    title: []const u8,
+    active: bool,
+};
+
+/// Draw the tab bar along the top of the surface. `bar_height` is the
+/// vertical extent of the strip (in pixels); the terminal grid starts
+/// below it. Each tab is a colored box with its title; the active tab is
+/// highlighted. The narrowest allowed box fits one cell.
+pub fn renderTabBar(
+    self: *Renderer,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    bar_height: u31,
+    items: []const TabBarItem,
+    active_bg: vt.color.RGB,
+    active_fg: vt.color.RGB,
+    bg: vt.color.RGB,
+    fg: vt.color.RGB,
+) !void {
+    if (bar_height == 0 or width == 0) return;
+    if (height < bar_height) return;
+    const cell_w = self.font.cell_width;
+    const cell_h = self.font.cell_height;
+    const box_h: u31 = @min(bar_height, @max(1, cell_h));
+    const pad_x: u31 = cell_w / 2;
+
+    var x0: u31 = 0;
+    for (items) |item| {
+        const cps = try self.overlayCodepoints(item.title);
+        const text_cells = overlayText(cps, std.math.maxInt(u31), false).width;
+        var box_w: u31 = @as(u31, text_cells) * cell_w + 2 * pad_x;
+        box_w = @max(box_w, cell_w);
+        if (box_w > width -| x0) break;
+
+        const is_active = item.active;
+        const box_bg = if (is_active) active_bg else bg;
+        const box_fg = if (is_active) active_fg else fg;
+        fillRect(
+            pixels,
+            self.pixelStride(width),
+            width,
+            height,
+            x0,
+            0,
+            box_w,
+            box_h,
+            argb(box_bg),
+        );
+        if (is_active and box_h > 1) {
+            // A thin accent line under the active tab.
+            fillRect(pixels, self.pixelStride(width), width, height, x0, box_h -| 2, box_w, 2, argb(active_fg));
+        }
+
+        // Title text, vertically centered.
+        if (cell_h > 0 and box_w > 2 * pad_x) {
+            const baseline_y: i32 = @divTrunc(@as(i32, box_h), 2) + self.font.baseline - @divTrunc(@as(i32, cell_h), 2);
+            var tx = x0 + pad_x;
+            var i: usize = 0;
+            while (i < cps.len) {
+                const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+                if (cluster.len == 0) break;
+                const cp = cps[i];
+                i += cluster.len;
+                const span: u31 = cluster.width;
+                if (span == 0) continue;
+                const face_idx = self.font.faceForCodepoint(self.alloc, cp);
+                const face = self.font.face(face_idx);
+                const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+                if (glyph_idx != 0) {
+                    const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+                    blitGlyph(
+                        pixels,
+                        self.pixelStride(width),
+                        width,
+                        height,
+                        g,
+                        @as(i32, tx) + @as(i32, g.bearing_x),
+                        baseline_y - @as(i32, g.bearing_y),
+                        argb(box_fg),
+                        false,
+                        self.glyph_clip_x,
+                    );
+                }
+                tx += span * cell_w;
+            }
+        }
+        x0 += box_w;
+    }
+}
+
 fn renderKittyItems(
     self: *Renderer,
     items: []const KittyRenderItem,
