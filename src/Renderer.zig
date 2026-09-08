@@ -659,10 +659,9 @@ pub fn renderPreedit(
         );
 
         const face_idx = self.font.faceForCodepoint(self.alloc, cp);
-        const face = self.font.face(face_idx);
-        const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
-        if (glyph_idx != 0) {
-            const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+        if (face_idx == Font.sprite_face_index) {
+            const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)));
+            self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
             blitGlyph(
                 pixels,
                 self.pixelStride(width),
@@ -675,6 +674,24 @@ pub fn renderPreedit(
                 false,
                 self.glyph_clip_x,
             );
+        } else {
+            const face = self.font.face(face_idx);
+            const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+            if (glyph_idx != 0) {
+                const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+                blitGlyph(
+                    pixels,
+                    self.pixelStride(width),
+                    width,
+                    height,
+                    g,
+                    @as(i32, x) * self.font.cell_width + g.bearing_x,
+                    baseline_y - g.bearing_y,
+                    argb(state.colors.foreground),
+                    false,
+                    self.glyph_clip_x,
+                );
+            }
         }
         try self.blitDecoration(.underline, x, y, argb(state.colors.foreground), pixels, width, height);
         x += span;
@@ -826,10 +843,9 @@ fn renderTextOverlay(
         if (span == 0) continue;
 
         const face_idx = self.font.faceForCodepoint(self.alloc, cp);
-        const face = self.font.face(face_idx);
-        const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
-        if (glyph_idx != 0) {
-            const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+        if (face_idx == Font.sprite_face_index) {
+            const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)));
+            self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
             blitGlyph(
                 pixels,
                 self.pixelStride(width),
@@ -842,6 +858,24 @@ fn renderTextOverlay(
                 false,
                 self.glyph_clip_x,
             );
+        } else {
+            const face = self.font.face(face_idx);
+            const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+            if (glyph_idx != 0) {
+                const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+                blitGlyph(
+                    pixels,
+                    self.pixelStride(width),
+                    width,
+                    height,
+                    g,
+                    @as(i32, x) * self.font.cell_width + g.bearing_x,
+                    baseline_y - g.bearing_y,
+                    argb(fg),
+                    false,
+                    self.glyph_clip_x,
+                );
+            }
         }
         x += span;
     }
@@ -2419,6 +2453,55 @@ test "scrollback viewport scrolls and renders older content" {
     // Scrolling back to active restores the bottom.
     pages.scroll(.active);
     try std.testing.expect(pages.viewport == .active);
+}
+
+test "preedit renders sprite glyphs alongside font glyphs" {
+    try testSpriteOverlay(.preedit);
+}
+
+test "search and link overlays render sprite glyphs alongside font glyphs" {
+    try testSpriteOverlay(.search);
+    try testSpriteOverlay(.link);
+}
+
+fn testSpriteOverlay(kind: enum { preedit, search, link }) !void {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    const width: u31 = font.cell_width * 2;
+    const height: u31 = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    @memset(pixels, 0);
+
+    // The full block must use the sprite face; the adjacent A uses a font.
+    try std.testing.expectEqual(Font.sprite_face_index, font.faceForCodepoint(alloc, 0x2588));
+    switch (kind) {
+        .preedit => try renderer.renderPreedit(&state, pixels, width, height, "█A"),
+        .search => try renderer.renderSearch(&state, pixels, width, height, "█A", false),
+        .link => try renderer.renderLinkHint(&state, pixels, width, height, "█A"),
+    }
+    const fg = argb(if (kind == .preedit) state.colors.foreground else renderer.selection_fg orelse state.colors.foreground);
+    const bg = if (kind == .preedit) renderer.backgroundPixel(state.colors.background) else argb(renderer.selection_bg);
+    const center = @as(usize, height / 2) * width + font.cell_width / 2;
+    try std.testing.expectEqual(fg, pixels[center]);
+
+    // Check the upper portion to exclude the preedit underline decoration.
+    var font_pixels: usize = 0;
+    for (0..height / 2) |y| {
+        for (font.cell_width..width) |x| {
+            if (pixels[y * width + x] != bg) font_pixels += 1;
+        }
+    }
+    try std.testing.expect(font_pixels > 0);
 }
 
 test "render a simple grid" {
