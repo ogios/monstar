@@ -7,7 +7,7 @@
 # this repository's working tree so the installed binary matches HEAD.
 #
 # Usage:
-#   ./packaging/install.sh              build + install (makepkg -si; sudo on install)
+#   ./packaging/install.sh              build + install (makepkg -si --noconfirm; sudo on install)
 #   ./packaging/install.sh --no-install build + package only (makepkg -s)
 #
 # Options:
@@ -72,7 +72,7 @@ grep '^pkgver\|^source\|^sha256\|^options' "$PKGDIR/PKGBUILD" >&2
 # -- Build (and optionally install) ----------------------------------------
 echo "==> Running makepkg in ${PKGDIR}"
 if [[ "$INSTALL" -eq 1 ]]; then
-  (cd "$PKGDIR" && makepkg -si) || die "makepkg -si failed"
+  (cd "$PKGDIR" && makepkg -si --noconfirm) || die "makepkg -si failed"
 else
   (cd "$PKGDIR" && makepkg -s) || die "makepkg -s failed"
 fi
