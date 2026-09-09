@@ -1020,6 +1020,45 @@ pub const TabBarItem = struct {
     active: bool,
 };
 
+/// Returns the tab box under the physical x coordinate, or null when the
+/// coordinate falls in unused space at the end of the strip. Uses the same
+/// adaptive title allocation as renderTabBar.
+pub fn tabBarItemAt(
+    alloc: std.mem.Allocator,
+    items: []const TabBarItem,
+    width: u31,
+    cell_width: u31,
+    x: u31,
+) !?usize {
+    if (items.len == 0 or width == 0 or cell_width == 0 or x >= width) return null;
+
+    const desired = try alloc.alloc(u31, items.len);
+    defer alloc.free(desired);
+    const budgets = try alloc.alloc(u31, items.len);
+    defer alloc.free(budgets);
+    var codepoints: std.ArrayList(u21) = .empty;
+    defer codepoints.deinit(alloc);
+
+    const max_fade_cells: u31 = @intCast(tab_fade_alphas.len);
+    var active_idx: usize = 0;
+    for (items, 0..) |item, i| {
+        codepoints.clearRetainingCapacity();
+        var it = (try std.unicode.Utf8View.init(item.title)).iterator();
+        while (it.nextCodepoint()) |cp| try codepoints.append(alloc, cp);
+        desired[i] = overlayText(codepoints.items, std.math.maxInt(u31), false).width +| 2 * max_fade_cells;
+        if (item.active) active_idx = i;
+    }
+    tabTitleBudgets(desired, budgets, width / cell_width, active_idx);
+
+    var x0: u31 = 0;
+    for (budgets, 0..) |budget, i| {
+        const box_width = tabBoxWidth(width, cell_width, x0, budget) orelse break;
+        if (x < x0 + box_width) return i;
+        x0 += box_width;
+    }
+    return null;
+}
+
 /// Draw the tab bar into `pixels`, which holds the strip alone. `bar_height`
 /// is the vertical extent of the strip (in pixels); the caller positions it
 /// on the configured edge. Each tab is a colored box with its title; the
@@ -1077,16 +1116,9 @@ pub fn renderTabBar(
 
     var x0: u31 = 0;
     for (items, 0..) |item, i| {
-        const remaining = width -| x0;
-        if (remaining < cell_w) break;
-
-        // Never let a tab spill past the strip: shrink its budget to what fits.
-        var budget = budgets[i];
-        const fit_cells: u31 = if (remaining > cell_w) remaining / cell_w - 1 else 0;
-        if (budget > fit_cells) budget = fit_cells;
-        const box_cells: u31 = budget + 1;
-        const box_w: u31 = box_cells * cell_w;
-        if (box_w > remaining) break;
+        const box_w = tabBoxWidth(width, cell_w, x0, budgets[i]) orelse break;
+        const box_cells = box_w / cell_w;
+        const budget = box_cells - 1;
 
         // Whole-cell fade runs consume title cells; a narrow tab drops steps
         // instead of overlapping the title.
@@ -1147,6 +1179,20 @@ pub fn renderTabBar(
         }
         x0 += box_w;
     }
+}
+
+/// Width of one rendered tab box after clipping its allocated title budget to
+/// the remaining strip. Kept shared by rendering and pointer hit testing.
+fn tabBoxWidth(width: u31, cell_width: u31, x0: u31, allocated_budget: u31) ?u31 {
+    const remaining = width -| x0;
+    if (remaining < cell_width) return null;
+
+    var budget = allocated_budget;
+    const fit_cells: u31 = if (remaining > cell_width) remaining / cell_width - 1 else 0;
+    if (budget > fit_cells) budget = fit_cells;
+    const box_width = (budget + 1) * cell_width;
+    if (box_width > remaining) return null;
+    return box_width;
 }
 
 /// Assign each tab a non-padding cell budget. Space is split evenly, tabs
@@ -2896,6 +2942,34 @@ test "tab title budgets elide long titles and favor the active tab" {
         tabTitleBudgets(&ideal, &budgets, 30, 0);
         try std.testing.expectEqualSlices(u31, &.{ 2, 2, 10, 10 }, &budgets);
     }
+}
+
+test "tab bar hit testing matches adaptive box allocation" {
+    const items = [_]TabBarItem{
+        .{ .title = "a", .active = false },
+        .{ .title = "bbbbbbbb", .active = true },
+    };
+    const cell_width: u31 = 10;
+    const width: u31 = 20 * cell_width;
+
+    try std.testing.expectEqual(@as(?usize, 0), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 0));
+    try std.testing.expectEqual(@as(?usize, 0), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 99));
+    try std.testing.expectEqual(@as(?usize, 1), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 100));
+    try std.testing.expectEqual(@as(?usize, 1), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 199));
+    try std.testing.expectEqual(@as(?usize, null), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 200));
+}
+
+test "tab bar hit testing leaves unused tail unclaimed" {
+    const items = [_]TabBarItem{
+        .{ .title = "long first title", .active = true },
+        .{ .title = "long second title", .active = false },
+        .{ .title = "long third title", .active = false },
+    };
+    const cell_width: u31 = 10;
+    const width: u31 = 8 * cell_width;
+
+    try std.testing.expectEqual(@as(?usize, 2), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 59));
+    try std.testing.expectEqual(@as(?usize, null), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 60));
 }
 
 test "narrow tab bar elides titles but still draws the active tab" {

@@ -206,6 +206,7 @@ and other actions are not yet supported. Search mode retains its own controls.
 | `Shift+Home` / `Shift+End` | Scroll to the top / bottom of scrollback |
 | `Ctrl++` / `Ctrl+=` / `Ctrl+-` | Adjust the font size |
 | `Ctrl+0` | Reset the font size |
+| Left click on a tab | Switch to that tab |
 | `Ctrl` + left click | Open a hyperlink or detected URI |
 | `Ctrl` + right click | Copy a hyperlink or detected URI |
 | `Ctrl` + drag | Make a rectangular selection |

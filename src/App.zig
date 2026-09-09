@@ -245,6 +245,9 @@ scroll_had_value120: bool,
 scroll_stopped: bool,
 /// True while the left button is down for terminal-side selection.
 selecting: bool,
+/// A left-button press consumed by the tab strip. Its matching release must
+/// not leak into terminal selection or application mouse reporting.
+tab_bar_press: bool,
 /// True when the active drag should produce a rectangular selection.
 selection_rectangle: bool,
 selection_gesture: vt.SelectionGesture,
@@ -710,6 +713,7 @@ pub fn init(
         .scroll_had_value120 = false,
         .scroll_stopped = false,
         .selecting = false,
+        .tab_bar_press = false,
         .selection_rectangle = false,
         .selection_gesture = .init,
         .mouse_button = null,
@@ -3292,6 +3296,7 @@ fn syncCursorShape(self: *App) void {
 }
 
 fn currentCursorShape(self: *App) Window.CursorShape {
+    if (self.pointerInTabBar()) return .default;
     if (self.scrollbar_hovered or self.scrollbar_drag != null or self.scrollbarThumbHit() != null) return .default;
     if (self.hoveredLinkUri() != null) return .pointer;
     if (self.tab().mouse_shape_explicit) return cursorShapeFromMouseShape(self.tab().term.mouse_shape);
@@ -3731,6 +3736,19 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             self.last_serial = button.serial;
             if (button.state == .pressed) self.stopFling();
             if (button.button == 272) { // BTN_LEFT
+                if (button.state == .pressed) self.tab_bar_press = false;
+                switch (button.state) {
+                    .pressed => if (self.pointerInTabBar()) {
+                        self.tab_bar_press = true;
+                        self.activateTabAtPointer();
+                        return;
+                    },
+                    .released => if (self.tab_bar_press) {
+                        self.tab_bar_press = false;
+                        return;
+                    },
+                    else => {},
+                }
                 if (button.state == .pressed and self.beginScrollbarDrag()) return;
                 if (button.state == .released and self.finishScrollbarDrag()) return;
             }
@@ -3814,6 +3832,75 @@ fn pointerSurfacePhysical(self: *const App) struct { x: f64, y: f64 } {
         .x = @max(0, self.pointer_x * scale),
         .y = @max(0, self.pointer_y * scale),
     };
+}
+
+const TabBarRect = struct {
+    top: u31,
+    height: u31,
+};
+
+fn tabBarRect(layout: TerminalLayout, configured_height: u31, position: Config.TabBarPosition) ?TabBarRect {
+    const reserved = switch (position) {
+        .top => layout.grid_y,
+        .bottom => layout.surface_height -| layout.grid_y -| layout.grid_height,
+    };
+    const height = @min(configured_height, reserved);
+    if (height == 0) return null;
+    return .{
+        .top = switch (position) {
+            .top => 0,
+            .bottom => layout.surface_height - height,
+        },
+        .height = height,
+    };
+}
+
+test "tab bar hit rectangle follows its configured edge and fitted padding" {
+    const layout: TerminalLayout = .{
+        .surface_width = 100,
+        .surface_height = 80,
+        .grid_x = 0,
+        .grid_y = 20,
+        .grid_width = 100,
+        .grid_height = 40,
+        .columns = 10,
+        .rows = 2,
+        .padding = .{ .top = 20, .bottom = 20 },
+    };
+
+    try std.testing.expectEqual(TabBarRect{ .top = 0, .height = 15 }, tabBarRect(layout, 15, .top).?);
+    try std.testing.expectEqual(TabBarRect{ .top = 65, .height = 15 }, tabBarRect(layout, 15, .bottom).?);
+    try std.testing.expectEqual(TabBarRect{ .top = 60, .height = 20 }, tabBarRect(layout, 30, .bottom).?);
+    try std.testing.expectEqual(@as(?TabBarRect, null), tabBarRect(layout, 0, .top));
+}
+
+fn pointerInTabBar(self: *const App) bool {
+    if (!self.pointer_inside) return false;
+    const rect = tabBarRect(self.layout, self.tab_bar_height, self.config.tab_bar_position) orelse return false;
+    const pos = self.pointerSurfacePhysical();
+    return pos.x < self.layout.surface_width and pos.y >= rect.top and pos.y < rect.top + rect.height;
+}
+
+fn activateTabAtPointer(self: *App) void {
+    const pos = self.pointerSurfacePhysical();
+    const x: u31 = @intFromFloat(pos.x);
+    const items = self.tabBarSnapshot() catch |err| {
+        log.warn("cannot hit test tab bar: {}", .{err});
+        return;
+    };
+    defer self.freeTabBarSnapshot(items);
+    const index = Renderer.tabBarItemAt(
+        self.alloc,
+        items,
+        self.layout.surface_width,
+        self.font.cell_width,
+        x,
+    ) catch |err| {
+        log.warn("cannot hit test tab bar: {}", .{err});
+        return;
+    };
+    if (index) |i| self.activateIndex(i);
+    self.syncCursorShape();
 }
 
 fn scrollbarPointerEligible(self: *App) bool {
