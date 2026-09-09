@@ -5,12 +5,13 @@
 //! `/proc`: the directory while sitting at a prompt and the running command
 //! line while one executes. This module detects the configured shell and
 //! injects the scripts under `share/monstar/shell-integration` using each
-//! shell's own startup mechanism.
+//! shell's own startup mechanism. When no OSC 2 title is available, the tab
+//! bar falls back to the PTY foreground process-group leader.
 //!
 //! Bash starts in POSIX mode and sources the script through `ENV`; zsh loads
 //! it through `ZDOTDIR`; fish, nushell, and elvish discover it through
-//! `XDG_DATA_DIRS`. Unsupported shells are left untouched and fall back to the
-//! tab index.
+//! `XDG_DATA_DIRS`. Unsupported shells are left untouched and use the same
+//! foreground-process fallback.
 
 const std = @import("std");
 
