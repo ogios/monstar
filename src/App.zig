@@ -248,6 +248,9 @@ selecting: bool,
 /// A left-button press consumed by the tab strip. Its matching release must
 /// not leak into terminal selection or application mouse reporting.
 tab_bar_press: bool,
+/// A middle-button press consumed by the tab strip. Kept separately from the
+/// left-button gesture so its release cannot paste after closing a tab.
+tab_bar_middle_press: bool,
 /// True when the active drag should produce a rectangular selection.
 selection_rectangle: bool,
 selection_gesture: vt.SelectionGesture,
@@ -714,6 +717,7 @@ pub fn init(
         .scroll_stopped = false,
         .selecting = false,
         .tab_bar_press = false,
+        .tab_bar_middle_press = false,
         .selection_rectangle = false,
         .selection_gesture = .init,
         .mouse_button = null,
@@ -2254,8 +2258,13 @@ fn moveTab(self: *App, direction: isize) void {
 /// last tab closes the window. A live child is hung up immediately, while its
 /// tab state is retained until SIGCHLD lets the event loop reap it.
 fn closeTab(self: *App) void {
+    self.closeTabAt(self.activeIndex());
+}
+
+fn closeTabAt(self: *App, idx: usize) void {
+    std.debug.assert(idx < self.tabs.items.len);
     if (self.tabs.items.len <= 1) {
-        self.active.hangup();
+        self.tabs.items[idx].hangup();
         self.window.running = false;
         return;
     }
@@ -2266,11 +2275,12 @@ fn closeTab(self: *App) void {
         log.warn("cannot close tab: failed to reserve child cleanup ({})", .{err});
         return;
     };
-    const idx = self.activeIndex();
-    if (idx + 1 < self.tabs.items.len) {
-        self.activateIndex(idx + 1);
-    } else {
-        self.activateIndex(idx - 1);
+    if (self.tabs.items[idx] == self.active) {
+        if (idx + 1 < self.tabs.items.len) {
+            self.activateIndex(idx + 1);
+        } else {
+            self.activateIndex(idx - 1);
+        }
     }
     const closing = self.tabs.orderedRemove(idx);
     // Stop the child immediately. Only cache/terminal destruction may wait
@@ -3752,6 +3762,21 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                 if (button.state == .pressed and self.beginScrollbarDrag()) return;
                 if (button.state == .released and self.finishScrollbarDrag()) return;
             }
+            if (button.button == 274) { // BTN_MIDDLE
+                if (button.state == .pressed) self.tab_bar_middle_press = false;
+                switch (button.state) {
+                    .pressed => if (self.pointerInTabBar()) {
+                        self.tab_bar_middle_press = true;
+                        self.closeTabAtPointer();
+                        return;
+                    },
+                    .released => if (self.tab_bar_middle_press) {
+                        self.tab_bar_middle_press = false;
+                        return;
+                    },
+                    else => {},
+                }
+            }
             // Mouse reporting wins when the application asked for it,
             // except that shift bypasses it for terminal-side selection.
             const reporting = self.tab().term.flags.mouse_event != .none and
@@ -3882,11 +3907,21 @@ fn pointerInTabBar(self: *const App) bool {
 }
 
 fn activateTabAtPointer(self: *App) void {
+    if (self.tabIndexAtPointer()) |index| self.activateIndex(index);
+    self.syncCursorShape();
+}
+
+fn closeTabAtPointer(self: *App) void {
+    if (self.tabIndexAtPointer()) |index| self.closeTabAt(index);
+    self.syncCursorShape();
+}
+
+fn tabIndexAtPointer(self: *App) ?usize {
     const pos = self.pointerSurfacePhysical();
     const x: u31 = @intFromFloat(pos.x);
     const items = self.tabBarSnapshot() catch |err| {
         log.warn("cannot hit test tab bar: {}", .{err});
-        return;
+        return null;
     };
     defer self.freeTabBarSnapshot(items);
     const index = Renderer.tabBarItemAt(
@@ -3897,10 +3932,9 @@ fn activateTabAtPointer(self: *App) void {
         x,
     ) catch |err| {
         log.warn("cannot hit test tab bar: {}", .{err});
-        return;
+        return null;
     };
-    if (index) |i| self.activateIndex(i);
-    self.syncCursorShape();
+    return index;
 }
 
 fn scrollbarPointerEligible(self: *App) bool {
