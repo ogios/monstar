@@ -4992,15 +4992,22 @@ fn finishScrollFrame(self: *App) void {
         self.resetScrollVelocity();
     }
 
+    // Mouse-tracking applications interpret each wheel event themselves, so
+    // kitty strips the multiplier to its sign and sends one event per detent.
+    // Match that: the user multiplier only applies to Monstar's own viewport
+    // scrolling, not to events forwarded to the child.
+    const mouse_tracking = self.tab().term.flags.mouse_event != .none;
+    const discrete_multiplier = if (mouse_tracking) 1.0 else self.config.mouse_scroll_multiplier.discrete;
+
     var lines: i32 = 0;
     if (self.scroll_had_value120) {
         const wheel_ticks = @as(f64, @floatFromInt(self.scroll_value120)) / 120.0;
-        const total = wheel_ticks * self.config.mouse_scroll_multiplier.discrete + self.scroll_line_remainder;
+        const total = wheel_ticks * discrete_multiplier + self.scroll_line_remainder;
         const whole = @trunc(total);
         lines = @intFromFloat(whole);
         self.scroll_line_remainder = total - whole;
     } else if (self.scroll_had_discrete) {
-        const total = @as(f64, @floatFromInt(self.scroll_clicks)) * self.config.mouse_scroll_multiplier.discrete +
+        const total = @as(f64, @floatFromInt(self.scroll_clicks)) * discrete_multiplier +
             self.scroll_line_remainder;
         const whole = @trunc(total);
         lines = @intFromFloat(whole);
@@ -5009,7 +5016,7 @@ fn finishScrollFrame(self: *App) void {
         // Logical pixels per row: physical cell height descaled.
         const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
             @as(f64, @floatFromInt(self.window.scale120));
-        const multiplier = self.precisionScrollScale();
+        const multiplier = if (mouse_tracking) 1.0 else self.precisionScrollScale();
         const pixels = self.scroll_pixels * multiplier;
         const whole = @divTrunc(pixels, cell);
         lines = @intFromFloat(whole);
