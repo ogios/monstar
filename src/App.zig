@@ -3306,7 +3306,7 @@ fn syncCursorShape(self: *App) void {
 }
 
 fn currentCursorShape(self: *App) Window.CursorShape {
-    if (self.pointerInTabBar()) return .default;
+    if (self.pointerInTabBar()) return .pointer;
     if (self.scrollbar_hovered or self.scrollbar_drag != null or self.scrollbarThumbHit() != null) return .default;
     if (self.hoveredLinkUri() != null) return .pointer;
     if (self.tab().mouse_shape_explicit) return cursorShapeFromMouseShape(self.tab().term.mouse_shape);
@@ -6278,12 +6278,42 @@ fn tabBarSnapshot(self: *App) ![]Renderer.TabBarItem {
     }
     for (self.tabs.items, 0..) |tb, i| {
         const title = if (tb.term.getTitle()) |text|
-            try self.alloc.dupe(u8, text)
+            if (text.len > 0) try self.alloc.dupe(u8, text) else try self.tabProcessTitle(tb, i)
         else
-            try std.fmt.allocPrint(self.alloc, "{d}", .{i + 1});
+            try self.tabProcessTitle(tb, i);
         try items.append(self.alloc, .{ .title = title, .active = tb == self.active });
     }
     return items.toOwnedSlice(self.alloc);
+}
+
+/// Use the foreground process-group leader when no application title is set.
+/// A full-screen child such as nvim can clear OSC 2 before returning to its
+/// parent; the PTY foreground group still identifies yazi (or the shell at a
+/// prompt), so the tab does not degrade to an opaque numeric label.
+fn tabProcessTitle(self: *App, tb: *Tab, index: usize) ![]u8 {
+    var foreground_pid: posix.pid_t = undefined;
+    const rc = std.os.linux.tcgetpgrp(tb.pty.master, &foreground_pid);
+    if (std.os.linux.errno(rc) != .SUCCESS) foreground_pid = tb.child_pid;
+    if (try self.processName(foreground_pid)) |name| return name;
+    if (foreground_pid != tb.child_pid) {
+        if (try self.processName(tb.child_pid)) |name| return name;
+    }
+    return std.fmt.allocPrint(self.alloc, "{d}", .{index + 1});
+}
+
+/// Read and own Linux's short, stable process name.
+fn processName(self: *App, pid: posix.pid_t) std.mem.Allocator.Error!?[]u8 {
+    if (pid <= 0) return null;
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return null;
+    const file = std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch return null;
+    defer file.close(self.io);
+
+    var name_buf: [256]u8 = undefined;
+    const len = posix.read(file.handle, &name_buf) catch return null;
+    const name = std.mem.trim(u8, name_buf[0..len], " \t\r\n");
+    if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) return null;
+    return try self.alloc.dupe(u8, name);
 }
 
 fn freeTabBarSnapshot(self: *App, items: []Renderer.TabBarItem) void {
