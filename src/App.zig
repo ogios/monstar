@@ -235,6 +235,7 @@ scroll_frame_pixels: f64,
 scroll_clicks: i32,
 scroll_value120: i32,
 scroll_line_remainder: f64,
+scroll_target: ScrollTarget,
 scroll_source: wl.Pointer.AxisSource,
 scroll_time_ms: u32,
 scroll_had_pixels: bool,
@@ -303,6 +304,8 @@ const fling_start_velocity = 150.0;
 const fling_min_velocity = 30.0;
 const fling_max_velocity = 8000.0;
 const velocity_smoothing = 0.75;
+
+const ScrollTarget = enum { viewport, keys, application };
 
 const ScrollbarDrag = struct {
     grab_offset: f64,
@@ -741,6 +744,7 @@ pub fn init(
         .scroll_clicks = 0,
         .scroll_value120 = 0,
         .scroll_line_remainder = 0,
+        .scroll_target = .viewport,
         .scroll_source = .wheel,
         .scroll_time_ms = 0,
         .scroll_had_pixels = false,
@@ -2382,6 +2386,7 @@ fn drainPipeline(self: *App) !void {
 fn syncPtyOutput(self: *App, consumed: bool) void {
     self.syncInBandSizeReports();
     self.syncSynchronizedOutput();
+    self.syncScrollTarget();
     self.syncActiveScreen();
     self.syncScrollbarHover();
     if (consumed) self.refreshSearch();
@@ -3002,6 +3007,7 @@ fn fireTaskbarProgressTimeout(self: *App) void {
 /// applying it at frame boundaries.
 fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
     const self: *App = @ptrCast(@alignCast(ctx));
+    self.syncScrollTarget();
     switch (event) {
         .enter => |enter| {
             self.pointer_x = enter.surface_x.toDouble();
@@ -4097,9 +4103,36 @@ fn formatDropPaste(self: *App, mime: []const u8, data: []const u8) ![]u8 {
     return try clipboard_format.formatUriListDrop(self.alloc, data);
 }
 
+fn scrollTarget(self: *const App) ScrollTarget {
+    if (self.term.flags.mouse_event != .none) return .application;
+    return if (self.term.screens.active_key == .alternate) .keys else .viewport;
+}
+
+fn syncScrollTarget(self: *App) void {
+    const target = self.scrollTarget();
+    if (target == self.scroll_target) return;
+    self.scroll_target = target;
+
+    // Remainders and kinetic motion belong to the previous recipient. In
+    // particular, raw precision pixels must not acquire the new scale.
+    self.stopFling();
+    self.resetScrollVelocity();
+    self.scroll_pixels = 0;
+    self.scroll_frame_pixels = 0;
+    self.scroll_clicks = 0;
+    self.scroll_value120 = 0;
+    self.scroll_line_remainder = 0;
+    self.scroll_source = .wheel;
+    self.scroll_had_pixels = false;
+    self.scroll_had_discrete = false;
+    self.scroll_had_value120 = false;
+    self.scroll_stopped = false;
+}
+
 /// Convert accumulated wheel movement into scrolled lines: wheel clicks
 /// count fixed lines, smooth (touchpad) scroll counts cell heights.
 fn finishScrollFrame(self: *App) void {
+    self.syncScrollTarget();
     if (self.scroll_had_pixels) {
         if (self.scroll_source == .finger) {
             self.trackScrollVelocity(self.scroll_frame_pixels, self.scroll_time_ms);
@@ -4110,13 +4143,12 @@ fn finishScrollFrame(self: *App) void {
         self.resetScrollVelocity();
     }
 
-    // Applications using mouse tracking interpret wheel events themselves.
-    // User-configured multipliers only control Monstar's viewport scrolling.
-    const mouse_tracking = self.term.flags.mouse_event != .none;
-    const discrete_multiplier = effectiveScrollMultiplier(
-        self.config.mouse_scroll_multiplier.discrete,
-        mouse_tracking,
-    );
+    // Mouse-tracking applications interpret wheel events themselves. Keep
+    // configured scaling for the viewport and alternate-screen key fallback.
+    const discrete_multiplier = if (self.scroll_target == .application)
+        1
+    else
+        self.config.mouse_scroll_multiplier.discrete;
 
     var lines: i32 = 0;
     if (self.scroll_had_value120) {
@@ -4135,7 +4167,7 @@ fn finishScrollFrame(self: *App) void {
         // Logical pixels per row: physical cell height descaled.
         const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
             @as(f64, @floatFromInt(self.window.scale120));
-        const multiplier = effectiveScrollMultiplier(self.precisionScrollScale(), mouse_tracking);
+        const multiplier = self.precisionScrollScale();
         const pixels = self.scroll_pixels * multiplier;
         const whole = @divTrunc(pixels, cell);
         lines = @intFromFloat(whole);
@@ -4158,18 +4190,8 @@ fn finishScrollFrame(self: *App) void {
 }
 
 fn precisionScrollScale(self: *const App) f64 {
+    if (self.scrollTarget() == .application) return 1;
     return wayland_precision_scroll_scale * self.config.mouse_scroll_multiplier.precision;
-}
-
-fn effectiveScrollMultiplier(configured: f64, mouse_tracking: bool) f64 {
-    return if (mouse_tracking) 1 else configured;
-}
-
-test "mouse tracking bypasses viewport scroll multipliers" {
-    try std.testing.expectEqual(@as(f64, 3), effectiveScrollMultiplier(3, false));
-    try std.testing.expectEqual(@as(f64, 0.25), effectiveScrollMultiplier(0.25, false));
-    try std.testing.expectEqual(@as(f64, 1), effectiveScrollMultiplier(3, true));
-    try std.testing.expectEqual(@as(f64, 1), effectiveScrollMultiplier(0.25, true));
 }
 
 /// Fold one finger-scroll frame into an exponential moving average in
@@ -4207,6 +4229,7 @@ fn stopFling(self: *App) void {
 }
 
 fn fireFling(self: *App) void {
+    self.syncScrollTarget();
     const expirations = readTimer(self.fling_fd) orelse return;
     if (!self.fling_active) return;
 
@@ -4216,6 +4239,224 @@ fn fireFling(self: *App) void {
 
     self.fling_velocity *= std.math.pow(f64, fling_decay_per_ms, dt_ms);
     if (@abs(self.fling_velocity) < fling_min_velocity) self.stopFling();
+}
+
+test "wheel frames route reports, viewport movement, and keys without sharing remainders" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.config = .{};
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 16, .rows = 3, .max_scrollback_bytes = 100_000 });
+    defer app.term.deinit(alloc);
+    var stream = app.term.vtStream();
+    defer stream.deinit();
+    app.write_queue = .empty;
+    defer app.write_queue.deinit(alloc);
+    // A backlog keeps actual encoded PTY input in the queue without a child.
+    try app.write_queue.append(alloc, 0);
+    app.write_queue_offset = 0;
+    app.keyboard.state = null;
+    app.window = try alloc.create(Window);
+    defer alloc.destroy(app.window);
+    app.window.pointer_enter_serial = null;
+    app.window.scale120 = 120;
+    app.window.cursor_shape = .text;
+    app.window.pointer = null;
+    app.font.cell_width = 10;
+    app.font.cell_height = 20;
+    app.layout = .init(160, 60, 10, 20, .{});
+    app.pointer_x = 5;
+    app.pointer_y = 5;
+    app.pointer_inside = false;
+    app.mouse_button = null;
+    app.mouse_shape_explicit = false;
+    app.selection_gesture = .init;
+    app.selection_autoscroll_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.selection_autoscroll_fd);
+    app.scrollbar_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.scrollbar_fd);
+    app.fling_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.fling_fd);
+    app.scrollbar_drag = null;
+    app.scrollbar_hovered = false;
+    app.scrollbar_reveal_hovered = false;
+    app.scrollbar_alpha = 0;
+    app.async_generation = 0;
+    app.held_frame = null;
+    app.hovered_link = null;
+    app.link_active = false;
+    app.link_checked_cell = null;
+    app.fling_active = false;
+    // Force the same initialization used when a new recipient takes over.
+    app.scroll_target = .application;
+    app.syncScrollTarget();
+
+    for ([_][]const u8{ "\x1b[?9h", "\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h" }, 0..) |mode, mode_index| {
+        stream.nextSlice(mode);
+        stream.nextSlice("\x1b[?1006h");
+        for ([_]bool{ false, true }) |alternate| {
+            stream.nextSlice(if (alternate) "\x1b[?1049h" else "\x1b[?1049l");
+            for ([_]f64{ 0.01, 0.25, 3, 10_000 }) |multiplier| {
+                app.config.mouse_scroll_multiplier = .{ .discrete = multiplier, .precision = multiplier };
+                for ([_]i32{ -1, 1 }) |sign| {
+                    for (0..3) |form| {
+                        app.write_queue.shrinkRetainingCapacity(1);
+                        switch (form) {
+                            0 => pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = sign } }),
+                            1 => pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = sign * 120 } }),
+                            else => pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(@as(f64, @floatFromInt(sign)) * 20) } }),
+                        }
+                        pointerEvent(app, .frame);
+                        // X10 suppresses wheel buttons; the other modes emit one report.
+                        const expected = if (mode_index == 0) "" else if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M";
+                        try std.testing.expectEqualStrings(expected, app.write_queue.items[1..]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Partial detents and precision pixels truncate toward zero, including reversals.
+    for ([_]i32{ -1, 1 }) |sign| {
+        app.write_queue.shrinkRetainingCapacity(1);
+        for ([_]i32{ 60, -30, 90 }, 0..) |amount, index| {
+            pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = sign * amount } });
+            pointerEvent(app, .frame);
+            if (index < 2) try std.testing.expectEqual(@as(usize, 1), app.write_queue.items.len);
+        }
+        try std.testing.expectEqualStrings(if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M", app.write_queue.items[1..]);
+        app.write_queue.shrinkRetainingCapacity(1);
+        for ([_]f64{ 7, -2, 15 }, 0..) |amount, index| {
+            pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(@as(f64, @floatFromInt(sign)) * amount) } });
+            pointerEvent(app, .frame);
+            if (index < 2) try std.testing.expectEqual(@as(usize, 1), app.write_queue.items.len);
+        }
+        try std.testing.expectEqualStrings(if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M", app.write_queue.items[1..]);
+    }
+
+    // value120 takes precedence over the legacy forms in the same frame.
+    app.write_queue.shrinkRetainingCapacity(1);
+    pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(80) } });
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 2 } });
+    pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = -120 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqualStrings("\x1b[<64;1;1M", app.write_queue.items[1..]);
+    try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+
+    // Local scrolling moves history instead of writing PTY input.
+    stream.nextSlice("\x1b[?1049l\x1b[?1003l");
+    for (0..30) |_| stream.nextSlice("line\r\n");
+    app.config.mouse_scroll_multiplier = .{ .discrete = 3, .precision = 2 };
+    const offset = app.term.screens.active.pages.scrollbar().offset;
+    app.write_queue.shrinkRetainingCapacity(1);
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(offset - 3, app.term.screens.active.pages.scrollbar().offset);
+    pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = -120 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(offset - 6, app.term.screens.active.pages.scrollbar().offset);
+    pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(-10) } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(offset - 9, app.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(@as(usize, 1), app.write_queue.items.len);
+
+    stream.nextSlice("\x1b[?1049h");
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqualStrings("\x1b[A\x1b[A\x1b[A", app.write_queue.items[1..]);
+
+    // A local half-line must not cancel the first opposite application detent.
+    stream.nextSlice("\x1b[?1049l");
+    app.config.mouse_scroll_multiplier.discrete = 0.5;
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(@as(f64, -0.5), app.scroll_line_remainder);
+    stream.nextSlice("\x1b[?1000h");
+    app.write_queue.shrinkRetainingCapacity(1);
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqualStrings("\x1b[<65;1;1M", app.write_queue.items[1..]);
+
+    // The reverse handoff must not lend an application's partial detent to local scrolling.
+    pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = 60 } });
+    pointerEvent(app, .frame);
+    stream.nextSlice("\x1b[?1000l");
+    const before = app.term.screens.active.pages.scrollbar().offset;
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(before, app.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(@as(f64, 0.5), app.scroll_line_remainder);
+
+    // A frame without new scroll must not reinterpret pending local pixels as reports or keys.
+    for ([_][]const u8{ "\x1b[?1000h", "\x1b[?1049h" }) |takeover| {
+        stream.nextSlice("\x1b[?1000l\x1b[?1049l");
+        app.config.mouse_scroll_multiplier.precision = 0.01;
+        app.write_queue.shrinkRetainingCapacity(1);
+        pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(100) } });
+        pointerEvent(app, .frame);
+        try std.testing.expectEqual(@as(f64, 100), app.scroll_pixels);
+        stream.nextSlice(takeover);
+        pointerEvent(app, .frame);
+        try std.testing.expectEqualStrings("", app.write_queue.items[1..]);
+        try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+    }
+
+    // Exercise the real timer consumer: one 8 ms tick at 3000 px/s is 24 pixels.
+    stream.nextSlice("\x1b[?1049l\x1b[?1000h");
+    app.syncScrollTarget();
+    for ([_]f64{ 0.01, 1, 10_000 }) |multiplier| {
+        app.config.mouse_scroll_multiplier.precision = multiplier;
+        app.scroll_pixels = 0;
+        app.resetScrollVelocity();
+        app.trackScrollVelocity(40, 100);
+        app.trackScrollVelocity(40, 110);
+        app.startFling();
+        try std.testing.expect(app.fling_active);
+        try std.testing.expectEqual(@as(f64, 3000), app.fling_velocity);
+        // A one-shot timer guarantees one expiration regardless of scheduler delay.
+        try std.testing.expect(setTimer(app.fling_fd, .{ .it_value = timespecFromNs(1), .it_interval = .{ .sec = 0, .nsec = 0 } }, "test fling"));
+        var fds = [_]posix.pollfd{.{ .fd = app.fling_fd, .events = posix.POLL.IN, .revents = 0 }};
+        try std.testing.expectEqual(@as(usize, 1), try posix.poll(&fds, 1000));
+        app.write_queue.shrinkRetainingCapacity(1);
+        app.fireFling();
+        try std.testing.expectEqualStrings("\x1b[<65;1;1M", app.write_queue.items[1..]);
+        try std.testing.expectEqual(@as(f64, 4), app.scroll_pixels);
+        app.stopFling();
+    }
+
+    // Mode changes cancel a running fling before it can deliver to another recipient.
+    app.scroll_velocity = 3000;
+    app.startFling();
+    stream.nextSlice("\x1b[?1000l");
+    app.write_queue.shrinkRetainingCapacity(1);
+    app.fireFling();
+    try std.testing.expect(!app.fling_active);
+    try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+    try std.testing.expectEqual(@as(f64, 0), app.scroll_velocity);
+    try std.testing.expectEqualStrings("", app.write_queue.items[1..]);
+}
+
+test "application fling threshold ignores precision configuration" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    app.config = .{};
+    app.term.flags.mouse_event = .normal;
+    app.fling_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.fling_fd);
+    for ([_]f64{ 0.01, 1, 10_000 }) |multiplier| {
+        app.config.mouse_scroll_multiplier.precision = multiplier;
+        for ([_]f64{ -4, -1, 1, 4 }) |pixels| {
+            app.fling_active = false;
+            app.resetScrollVelocity();
+            app.trackScrollVelocity(pixels, 100);
+            app.trackScrollVelocity(pixels, 110);
+            app.startFling();
+            try std.testing.expectEqual(pixels * 75, app.scroll_velocity);
+            try std.testing.expectEqual(@abs(pixels) == 4, app.fling_active);
+            app.stopFling();
+        }
+    }
 }
 
 fn scrollbarAtBottom(scrollbar: vt.PageList.Scrollbar) bool {
@@ -4429,7 +4670,8 @@ fn fireScrollbarFade(self: *App) void {
 /// alternate screen, otherwise the scrollback viewport.
 fn scrollLines(self: *App, lines_down: i32) void {
     const lines_abs: u32 = @abs(lines_down);
-    if (self.term.flags.mouse_event != .none) {
+    const target = self.scrollTarget();
+    if (target == .application) {
         // A selection can exist here via the shift override; scrolling
         // hands control back to the application, so drop it.
         self.clearSelection();
@@ -4445,7 +4687,7 @@ fn scrollLines(self: *App, lines_down: i32) void {
         return;
     }
 
-    if (self.term.screens.active_key == .alternate) {
+    if (target == .keys) {
         // Full-screen apps without mouse support (pagers, editors)
         // expect cursor keys instead of viewport scrolling; the app
         // will move content, so any selection over it goes stale.
