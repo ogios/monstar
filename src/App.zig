@@ -4110,15 +4110,23 @@ fn finishScrollFrame(self: *App) void {
         self.resetScrollVelocity();
     }
 
+    // Applications using mouse tracking interpret wheel events themselves.
+    // User-configured multipliers only control Monstar's viewport scrolling.
+    const mouse_tracking = self.term.flags.mouse_event != .none;
+    const discrete_multiplier = effectiveScrollMultiplier(
+        self.config.mouse_scroll_multiplier.discrete,
+        mouse_tracking,
+    );
+
     var lines: i32 = 0;
     if (self.scroll_had_value120) {
         const wheel_ticks = @as(f64, @floatFromInt(self.scroll_value120)) / 120.0;
-        const total = wheel_ticks * self.config.mouse_scroll_multiplier.discrete + self.scroll_line_remainder;
+        const total = wheel_ticks * discrete_multiplier + self.scroll_line_remainder;
         const whole = @trunc(total);
         lines = @intFromFloat(whole);
         self.scroll_line_remainder = total - whole;
     } else if (self.scroll_had_discrete) {
-        const total = @as(f64, @floatFromInt(self.scroll_clicks)) * self.config.mouse_scroll_multiplier.discrete +
+        const total = @as(f64, @floatFromInt(self.scroll_clicks)) * discrete_multiplier +
             self.scroll_line_remainder;
         const whole = @trunc(total);
         lines = @intFromFloat(whole);
@@ -4127,7 +4135,7 @@ fn finishScrollFrame(self: *App) void {
         // Logical pixels per row: physical cell height descaled.
         const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
             @as(f64, @floatFromInt(self.window.scale120));
-        const multiplier = self.precisionScrollScale();
+        const multiplier = effectiveScrollMultiplier(self.precisionScrollScale(), mouse_tracking);
         const pixels = self.scroll_pixels * multiplier;
         const whole = @divTrunc(pixels, cell);
         lines = @intFromFloat(whole);
@@ -4151,6 +4159,17 @@ fn finishScrollFrame(self: *App) void {
 
 fn precisionScrollScale(self: *const App) f64 {
     return wayland_precision_scroll_scale * self.config.mouse_scroll_multiplier.precision;
+}
+
+fn effectiveScrollMultiplier(configured: f64, mouse_tracking: bool) f64 {
+    return if (mouse_tracking) 1 else configured;
+}
+
+test "mouse tracking bypasses viewport scroll multipliers" {
+    try std.testing.expectEqual(@as(f64, 3), effectiveScrollMultiplier(3, false));
+    try std.testing.expectEqual(@as(f64, 0.25), effectiveScrollMultiplier(0.25, false));
+    try std.testing.expectEqual(@as(f64, 1), effectiveScrollMultiplier(3, true));
+    try std.testing.expectEqual(@as(f64, 1), effectiveScrollMultiplier(0.25, true));
 }
 
 /// Fold one finger-scroll frame into an exponential moving average in
