@@ -4437,6 +4437,7 @@ fn scrollLines(self: *App, lines_down: i32) void {
     }
 
     self.term.screens.active.pages.scroll(.{ .delta_row = lines_down });
+    if (self.selecting) self.extendSelection();
     self.revealScrollbar();
     self.needs_redraw = true;
     self.syncHoveredLink(true);
