@@ -21,7 +21,10 @@ cd "$REPO_ROOT"
 
 INSTALL=1
 
-die() { echo "error: $*" >&2; exit 1; }
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
 
 usage() {
   sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -29,31 +32,32 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --no-install)
-      INSTALL=0
-      shift
-      ;;
-    -h|--help)
-      usage; exit 0
-      ;;
-    *)
-      die "unknown option: $1 (see --help)"
-      ;;
+  --no-install)
+    INSTALL=0
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    die "unknown option: $1 (see --help)"
+    ;;
   esac
 done
 
 # -- Preflight -------------------------------------------------------------
-command -v makepkg >/dev/null 2>&1 \
-  || die "makepkg not found (install base-devel) -- this script targets Arch Linux"
-command -v pacman >/dev/null 2>&1 \
-  || die "pacman not found -- this script targets Arch Linux"
+command -v makepkg >/dev/null 2>&1 ||
+  die "makepkg not found (install base-devel) -- this script targets Arch Linux"
+command -v pacman >/dev/null 2>&1 ||
+  die "pacman not found -- this script targets Arch Linux"
 
 # -- Generate PKGBUILD in an isolated dir ----------------------------------
 PKGDIR="$(mktemp -d)"
 trap 'rm -rf "$PKGDIR"' EXIT
 
-echo "==> Generating PKGBUILD from packaging/arch/monstar-git.PKGBUILD.in"
-sed 's/@VERSION@/0/' packaging/arch/monstar-git.PKGBUILD.in > "$PKGDIR/PKGBUILD"
+echo "==> Generating PKGBUILD from packaging/arch/monstar-with-fx-git.PKGBUILD.in"
+sed 's/@VERSION@/0/' packaging/arch/monstar-with-fx-git.PKGBUILD.in >"$PKGDIR/PKGBUILD"
 
 # Point the source at this repository's working tree so makepkg builds the
 # checked-out HEAD (a local file:// git source, unlike the default GitHub
